@@ -19,7 +19,9 @@ app.get('/', async (req, res) => {
   try {
     const { rows } = await db.query('SELECT NOW()');
     res.status(200).json({ message: "Welcome!", db_status: "Connected", db_time: rows[0].now });
-  } catch (err) { res.status(500).json({ message: "DB connection failed.", db_status: "Error" }); }
+  } catch (err) {
+    res.status(500).json({ message: "DB connection failed.", db_status: "Error" });
+  }
 });
 
 // --- CUSTOMER ROUTES ---
@@ -27,8 +29,12 @@ app.get('/api/customers', async (req, res) => {
   try {
     const allCustomers = await db.query("SELECT id, name, phone_number, address FROM Customers ORDER BY name ASC");
     res.json(allCustomers.rows);
-  } catch (err) { console.error("GET Customers Error:", err.message); res.status(500).send("Server Error"); }
+  } catch (err) {
+      console.error("GET Customers Error:", err.message);
+      res.status(500).send("Server Error");
+  }
 });
+
 app.get('/api/customers/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id);
@@ -44,8 +50,12 @@ app.get('/api/customers/:id', async (req, res) => {
       customer.customer_image_url = `data:${mimeType};base64,${imageBase64}`;
     }
     res.json(customer);
-  } catch (err) { console.error("GET Customer Error:", err.message); res.status(500).send("Server Error"); }
+  } catch (err) {
+    console.error("GET Customer Error:", err.message);
+    res.status(500).send("Server Error");
+  }
 });
+
 app.post('/api/customers', upload.single('photo'), async (req, res) => {
   try {
     const { name, phone_number, address } = req.body;
@@ -56,8 +66,12 @@ app.post('/api/customers', upload.single('photo'), async (req, res) => {
       [name, phone_number, address, imageBuffer]
     );
     res.status(201).json(newCustomerResult.rows[0]);
-  } catch (err) { console.error("POST Customer Error:", err.message); res.status(500).send("Server Error"); }
+  } catch (err) {
+    console.error("POST Customer Error:", err.message);
+    res.status(500).send("Server Error");
+  }
 });
+
 app.put('/api/customers/:id', upload.single('photo'), async (req, res) => {
     try {
         const id = parseInt(req.params.id);
@@ -80,15 +94,157 @@ app.put('/api/customers/:id', upload.single('photo'), async (req, res) => {
     } catch (err) { console.error("PUT Customer Error:", err.message); res.status(500).send("Server Error"); }
 });
 
-// --- LOAN ROUTES ---
+// --- LOAN ROUTES (ORDER MATTERS!) ---
+
+// GET all active loans (excluding overdue)
 app.get('/api/loans', async (req, res) => {
   try {
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
-    const query = `SELECT l.id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date, c.name AS customer_name, c.phone_number FROM Loans l JOIN Customers c ON l.customer_id = c.id WHERE l.status = 'active' ORDER BY l.pledge_date DESC`;
+    const query = `
+      SELECT l.id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date,
+             c.name AS customer_name, c.phone_number
+      FROM Loans l JOIN Customers c ON l.customer_id = c.id
+      WHERE l.status = 'active'
+      ORDER BY l.pledge_date DESC`;
     const allLoans = await db.query(query);
     res.json(allLoans.rows);
-  } catch (err) { console.error("GET Loans Error:", err.message); res.status(500).send("Server Error"); }
+  } catch (err) {
+    console.error("GET Loans Error:", err.message);
+    res.status(500).send("Server Error");
+  }
 });
+
+// GET recently created loans (for dashboard)
+app.get('/api/loans/recent/created', async (req, res) => {
+  try {
+    const query = `SELECT l.id, l.principal_amount, c.name AS customer_name FROM Loans l LEFT JOIN Customers c ON l.customer_id = c.id ORDER BY l.created_at DESC LIMIT 5`;
+    res.json((await db.query(query)).rows);
+  } catch (err) {
+    console.error("Recent Created Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
+// GET recently closed loans (for dashboard)
+app.get('/api/loans/recent/closed', async (req, res) => {
+  try {
+    const query = `SELECT l.id, l.principal_amount, c.name AS customer_name FROM Loans l LEFT JOIN Customers c ON l.customer_id = c.id WHERE l.status = 'paid' ORDER BY l.created_at DESC LIMIT 5`;
+    res.json((await db.query(query)).rows);
+  } catch (err) {
+    console.error("Recent Closed Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
+// GET all overdue loans (DEFINED BEFORE /:id)
+// === GET ALL OVERDUE LOANS (FINAL ROBUST VERSION) ===
+app.get('/api/loans/overdue', async (req, res) => {
+  try {
+    console.log("--- CORRECT ROUTE HIT: /api/loans/overdue ---"); // Logging
+
+    // Step 1: Directly SELECT loans based on the date condition and 'active' status.
+    // This query finds loans that *should* be overdue.
+    const query = `
+      SELECT
+        l.id, l.due_date, c.name AS customer_name,
+        l.principal_amount, l.book_loan_number, l.pledge_date
+      FROM Loans l
+      JOIN Customers c ON l.customer_id = c.id
+      WHERE l.due_date < NOW() AND l.status = 'active' -- Find active loans past due date
+      ORDER BY l.due_date ASC
+    `;
+    const overdueLoansResult = await db.query(query);
+    const overdueLoans = overdueLoansResult.rows;
+
+    // Step 2 (Important): If we found any loans, update their status to 'overdue'.
+    // This runs after selection, ensuring data consistency for future queries.
+    if (overdueLoans.length > 0) {
+        const idsToUpdate = overdueLoans.map(loan => loan.id);
+        // Construct a query to update all found loans at once
+        const updateQuery = `UPDATE Loans SET status = 'overdue' WHERE id = ANY($1::int[]) AND status = 'active'`;
+        await db.query(updateQuery, [idsToUpdate]);
+        console.log(`Marked ${idsToUpdate.length} loans as overdue.`);
+    } else {
+         console.log("No active loans found past their due date to mark as overdue.");
+         // Also fetch loans already marked as overdue from previous runs
+         const alreadyOverdueQuery = `
+            SELECT l.id, l.due_date, c.name AS customer_name, l.principal_amount, l.book_loan_number, l.pledge_date
+            FROM Loans l JOIN Customers c ON l.customer_id = c.id
+            WHERE l.status = 'overdue' ORDER BY l.due_date ASC`;
+         const alreadyOverdueLoans = await db.query(alreadyOverdueQuery);
+         return res.json(alreadyOverdueLoans.rows); // Return previously marked overdue loans
+    }
+
+    res.json(overdueLoans); // Return the loans found in Step 1
+
+  } catch (err) {
+    console.error("OVERDUE LOANS API ERROR:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
+// FIND a loan by its book loan number
+app.get('/api/loans/find-by-book-number/:bookNumber', async (req, res) => {
+  try {
+    const { bookNumber } = req.params;
+    const result = await db.query("SELECT id FROM Loans WHERE book_loan_number = $1", [bookNumber]);
+    if (result.rows.length === 0) return res.status(404).json({ error: "No loan found." });
+    res.json({ loanId: result.rows[0].id });
+  } catch (err) {
+    console.error("Find Loan Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
+// === GET A SINGLE LOAN (ENHANCED: Fetches Customer Details) ===
+app.get('/api/loans/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // 1. Join Loans, PledgedItems, AND Customers tables
+    const loanQuery = `
+      SELECT 
+        l.*, 
+        pi.item_type, pi.description, pi.quality, pi.weight, pi.item_image_data,
+        c.name AS customer_name, c.phone_number, c.customer_image_url
+      FROM Loans l 
+      LEFT JOIN PledgedItems pi ON l.id = pi.loan_id 
+      JOIN Customers c ON l.customer_id = c.id
+      WHERE l.id = $1`;
+
+    const loanResult = await db.query(loanQuery, [id]);
+    if (loanResult.rows.length === 0) return res.status(404).json({ error: "Loan not found." });
+
+    let loanDetails = loanResult.rows[0];
+
+    // 2. Convert ITEM image BYTEA to Base64 Data URL
+    if (loanDetails.item_image_data) {
+      const imageBase64 = loanDetails.item_image_data.toString('base64');
+      let mimeType = 'image/jpeg';
+      if (imageBase64.startsWith('/9j/')) mimeType = 'image/jpeg';
+      else if (imageBase64.startsWith('iVBORw0KGgo')) mimeType = 'image/png';
+      loanDetails.item_image_data_url = `data:${mimeType};base64,${imageBase64}`;
+    }
+    delete loanDetails.item_image_data; // Clean up buffer
+
+    // 3. Convert CUSTOMER image BYTEA to Base64 Data URL
+    if (loanDetails.customer_image_url) {
+      const imageBase64 = loanDetails.customer_image_url.toString('base64');
+      let mimeType = 'image/jpeg';
+      if (imageBase64.startsWith('/9j/')) mimeType = 'image/jpeg';
+      else if (imageBase64.startsWith('iVBORw0KGgo')) mimeType = 'image/png';
+      loanDetails.customer_image_url = `data:${mimeType};base64,${imageBase64}`;
+    }
+
+    const transactionsResult = await db.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date DESC", [id]);
+    res.json({ loanDetails: loanDetails, transactions: transactionsResult.rows });
+  } catch (err) {
+    console.error("GET Loan Details Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
+// CREATE a new loan
 app.post('/api/loans', upload.single('itemPhoto'), async (req, res) => {
   const client = await db.pool.connect();
   try {
@@ -109,6 +265,8 @@ app.post('/api/loans', upload.single('itemPhoto'), async (req, res) => {
     res.status(500).send("Server Error while creating loan");
   } finally { client.release(); }
 });
+
+// GET all loans for a specific customer
 app.get('/api/customers/:id/loans', async (req, res) => {
   try {
     const { id } = req.params;
@@ -117,33 +275,6 @@ app.get('/api/customers/:id/loans', async (req, res) => {
     const customerLoans = await db.query(query, [id]);
     res.json(customerLoans.rows);
   } catch (err) { console.error("GET Customer Loans Error:", err.message); res.status(500).send("Server Error"); }
-});
-app.get('/api/loans/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const loanQuery = `SELECT l.*, pi.item_type, pi.description, pi.quality, pi.weight, pi.item_image_data FROM Loans l LEFT JOIN PledgedItems pi ON l.id = pi.loan_id WHERE l.id = $1`;
-    const loanResult = await db.query(loanQuery, [id]);
-    if (loanResult.rows.length === 0) return res.status(404).json({ error: "Loan not found." });
-    let loanDetails = loanResult.rows[0];
-    if (loanDetails.item_image_data) {
-      const imageBase64 = loanDetails.item_image_data.toString('base64');
-      let mimeType = 'image/jpeg';
-      if (imageBase64.startsWith('/9j/')) mimeType = 'image/jpeg';
-      else if (imageBase64.startsWith('iVBORw0KGgo')) mimeType = 'image/png';
-      loanDetails.item_image_data_url = `data:${mimeType};base64,${imageBase64}`;
-    }
-    delete loanDetails.item_image_data;
-    const transactionsResult = await db.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date DESC", [id]);
-    res.json({ loanDetails: loanDetails, transactions: transactionsResult.rows });
-  } catch (err) { console.error("GET Loan Details Error:", err.message); res.status(500).send("Server Error"); }
-});
-app.get('/api/loans/find-by-book-number/:bookNumber', async (req, res) => {
-  try {
-    const { bookNumber } = req.params;
-    const result = await db.query("SELECT id FROM Loans WHERE book_loan_number = $1", [bookNumber]);
-    if (result.rows.length === 0) return res.status(404).json({ error: "No loan found." });
-    res.json({ loanId: result.rows[0].id });
-  } catch (err) { console.error("Find Loan Error:", err.message); res.status(500).send("Server Error"); }
 });
 
 // --- TRANSACTION & SETTLEMENT ---
@@ -179,7 +310,7 @@ app.post('/api/loans/:id/settle', async (req, res) => {
   } catch (err) { console.error("Settle Loan Error:", err.message); res.status(500).send("Server Error"); }
 });
 
-// --- DASHBOARD & OVERDUE ROUTES ---
+// --- DASHBOARD ROUTE ---
 app.get('/api/dashboard/stats', async (req, res) => {
   try {
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
@@ -189,42 +320,6 @@ app.get('/api/dashboard/stats', async (req, res) => {
     const [active, disbursed, overdue] = await Promise.all([activePromise, disbursedPromise, overduePromise]);
     res.json({ active_loans: active.rows[0].count, total_disbursed: disbursed.rows[0].sum || 0, overdue_loans: overdue.rows[0].count });
   } catch (err) { console.error("Dashboard Stats Error:", err.message); res.status(500).send("Server Error"); }
-});
-app.get('/api/loans/recent/created', async (req, res) => {
-  try {
-    const query = `SELECT l.id, l.principal_amount, c.name AS customer_name FROM Loans l LEFT JOIN Customers c ON l.customer_id = c.id ORDER BY l.created_at DESC LIMIT 5`;
-    res.json((await db.query(query)).rows);
-  } catch (err) { console.error("Recent Created Error:", err.message); res.status(500).send("Server Error"); }
-});
-app.get('/api/loans/recent/closed', async (req, res) => {
-  try {
-    const query = `SELECT l.id, l.principal_amount, c.name AS customer_name FROM Loans l LEFT JOIN Customers c ON l.customer_id = c.id WHERE l.status = 'paid' ORDER BY l.created_at DESC LIMIT 5`;
-    res.json((await db.query(query)).rows);
-  } catch (err) { console.error("Recent Closed Error:", err.message); res.status(500).send("Server Error"); }
-});
-
-// === GET ALL OVERDUE LOANS (FINAL GUARANTEED CORRECT VERSION) ===
-app.get('/api/loans/overdue', async (req, res) => {
-  try {
-    // Step 1: Ensure status is updated for any newly overdue loans.
-    await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
-
-    // Step 2: Select all loans that NOW have the 'overdue' status.
-    const query = `
-      SELECT
-        l.id, l.due_date, c.name AS customer_name,
-        l.principal_amount, l.book_loan_number, l.pledge_date
-      FROM Loans l
-      JOIN Customers c ON l.customer_id = c.id
-      WHERE l.status = 'overdue'
-      ORDER BY l.due_date ASC
-    `;
-    const overdueLoans = await db.query(query);
-    res.json(overdueLoans.rows);
-  } catch (err) {
-    console.error("OVERDUE LOANS API ERROR:", err.message);
-    res.status(500).send("Server Error while fetching overdue loans");
-  }
 });
 
 // --- START THE SERVER ---
