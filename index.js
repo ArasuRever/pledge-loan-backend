@@ -3,18 +3,40 @@ const db = require('./db');
 const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+require('dotenv').config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 const PORT = 3001;
+const JWT_SECRET = process.env.JWT_SECRET || 'a-very-strong-secret-key-that-you-should-change';
 
-// --- MULTER CONFIGURATION (Using memoryStorage) ---
+// --- MULTER CONFIGURATION (Using memoryStorage for BYTEA storage) ---
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
-// REMOVED: app.use('/uploads', ...)
+// REMOVED: app.use('/uploads', ...) - Not needed for DB storage
 
-// --- UTILITY ROUTE ---
+// --- AUTHENTICATION MIDDLEWARE ---
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Format: "Bearer TOKEN"
+
+  if (token == null) {
+    return res.sendStatus(401); // Unauthorized
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.sendStatus(403); // Forbidden (token is invalid)
+    }
+    req.user = user; // Add the user payload (e.g., userId, username) to the request
+    next(); // Proceed to the protected route
+  });
+};
+
+// --- UTILITY ROUTE (Public) ---
 app.get('/', async (req, res) => {
   try {
     const { rows } = await db.query('SELECT NOW()');
@@ -24,18 +46,76 @@ app.get('/', async (req, res) => {
   }
 });
 
-// --- CUSTOMER ROUTES ---
-app.get('/api/customers', async (req, res) => {
+// --- AUTHENTICATION ROUTES (Public) ---
+app.post('/api/auth/register', async (req, res) => {
   try {
-    const allCustomers = await db.query("SELECT id, name, phone_number, address FROM Customers ORDER BY name ASC");
-    res.json(allCustomers.rows);
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).send('Username and password are required.');
+    }
+    
+    // Hash the password
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    const newUser = await db.query(
+      "INSERT INTO Users (username, password) VALUES ($1, $2) RETURNING id, username",
+      [username, hashedPassword]
+    );
+    res.status(201).json(newUser.rows[0]);
   } catch (err) {
-      console.error("GET Customers Error:", err.message);
-      res.status(500).send("Server Error");
+    if (err.code === '23505') {
+      return res.status(400).send('Username already exists.');
+    }
+    console.error("Registration Error:", err.message);
+    res.status(500).send('Server error during registration.');
   }
 });
 
-app.get('/api/customers/:id', async (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).send('Username and password are required.');
+    }
+
+    // Find the user
+    const userResult = await db.query("SELECT * FROM Users WHERE username = $1", [username]);
+    if (userResult.rows.length === 0) {
+      return res.status(401).send('Invalid credentials.');
+    }
+    const user = userResult.rows[0];
+
+    // Check the password
+    const validPassword = await bcrypt.compare(password, user.password);
+    if (!validPassword) {
+      return res.status(401).send('Invalid credentials.');
+    }
+
+    // Create and send token
+    const token = jwt.sign(
+      { userId: user.id, username: user.username },
+      JWT_SECRET,
+      { expiresIn: '8h' } // Token lasts for 8 hours
+    );
+
+    res.json({ token });
+
+  } catch (err) {
+    console.error("Login Error:", err.message);
+    res.status(500).send('Server error during login.');
+  }
+});
+
+// --- CUSTOMER ROUTES (Protected) ---
+app.get('/api/customers', authenticateToken, async (req, res) => {
+  try {
+    const allCustomers = await db.query("SELECT id, name, phone_number, address FROM Customers ORDER BY name ASC");
+    res.json(allCustomers.rows);
+  } catch (err) { res.status(500).send("Server Error"); }
+});
+
+app.get('/api/customers/:id', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
@@ -56,7 +136,7 @@ app.get('/api/customers/:id', async (req, res) => {
   }
 });
 
-app.post('/api/customers', upload.single('photo'), async (req, res) => {
+app.post('/api/customers', authenticateToken, upload.single('photo'), async (req, res) => {
   try {
     const { name, phone_number, address } = req.body;
     const imageBuffer = req.file ? req.file.buffer : null;
@@ -72,7 +152,7 @@ app.post('/api/customers', upload.single('photo'), async (req, res) => {
   }
 });
 
-app.put('/api/customers/:id', upload.single('photo'), async (req, res) => {
+app.put('/api/customers/:id', authenticateToken, upload.single('photo'), async (req, res) => {
     try {
         const id = parseInt(req.params.id);
         if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
@@ -94,10 +174,10 @@ app.put('/api/customers/:id', upload.single('photo'), async (req, res) => {
     } catch (err) { console.error("PUT Customer Error:", err.message); res.status(500).send("Server Error"); }
 });
 
-// --- LOAN ROUTES (ORDER MATTERS!) ---
+// --- LOAN ROUTES (Protected & Ordered Correctly) ---
 
-// GET all active loans (excluding overdue)
-app.get('/api/loans', async (req, res) => {
+// GET all active loans
+app.get('/api/loans', authenticateToken, async (req, res) => {
   try {
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
     const query = `
@@ -114,8 +194,8 @@ app.get('/api/loans', async (req, res) => {
   }
 });
 
-// GET recently created loans (for dashboard)
-app.get('/api/loans/recent/created', async (req, res) => {
+// GET recently created loans
+app.get('/api/loans/recent/created', authenticateToken, async (req, res) => {
   try {
     const query = `SELECT l.id, l.principal_amount, c.name AS customer_name FROM Loans l LEFT JOIN Customers c ON l.customer_id = c.id ORDER BY l.created_at DESC LIMIT 5`;
     res.json((await db.query(query)).rows);
@@ -125,8 +205,8 @@ app.get('/api/loans/recent/created', async (req, res) => {
   }
 });
 
-// GET recently closed loans (for dashboard)
-app.get('/api/loans/recent/closed', async (req, res) => {
+// GET recently closed loans
+app.get('/api/loans/recent/closed', authenticateToken, async (req, res) => {
   try {
     const query = `SELECT l.id, l.principal_amount, c.name AS customer_name FROM Loans l LEFT JOIN Customers c ON l.customer_id = c.id WHERE l.status = 'paid' ORDER BY l.created_at DESC LIMIT 5`;
     res.json((await db.query(query)).rows);
@@ -136,55 +216,25 @@ app.get('/api/loans/recent/closed', async (req, res) => {
   }
 });
 
-// GET all overdue loans (DEFINED BEFORE /:id)
-// === GET ALL OVERDUE LOANS (FINAL ROBUST VERSION) ===
-app.get('/api/loans/overdue', async (req, res) => {
+// GET all overdue loans (Defined before /:id)
+app.get('/api/loans/overdue', authenticateToken, async (req, res) => {
   try {
-    console.log("--- CORRECT ROUTE HIT: /api/loans/overdue ---"); // Logging
-
-    // Step 1: Directly SELECT loans based on the date condition and 'active' status.
-    // This query finds loans that *should* be overdue.
+    await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
     const query = `
-      SELECT
-        l.id, l.due_date, c.name AS customer_name,
-        l.principal_amount, l.book_loan_number, l.pledge_date
-      FROM Loans l
-      JOIN Customers c ON l.customer_id = c.id
-      WHERE l.due_date < NOW() AND l.status = 'active' -- Find active loans past due date
-      ORDER BY l.due_date ASC
-    `;
-    const overdueLoansResult = await db.query(query);
-    const overdueLoans = overdueLoansResult.rows;
-
-    // Step 2 (Important): If we found any loans, update their status to 'overdue'.
-    // This runs after selection, ensuring data consistency for future queries.
-    if (overdueLoans.length > 0) {
-        const idsToUpdate = overdueLoans.map(loan => loan.id);
-        // Construct a query to update all found loans at once
-        const updateQuery = `UPDATE Loans SET status = 'overdue' WHERE id = ANY($1::int[]) AND status = 'active'`;
-        await db.query(updateQuery, [idsToUpdate]);
-        console.log(`Marked ${idsToUpdate.length} loans as overdue.`);
-    } else {
-         console.log("No active loans found past their due date to mark as overdue.");
-         // Also fetch loans already marked as overdue from previous runs
-         const alreadyOverdueQuery = `
-            SELECT l.id, l.due_date, c.name AS customer_name, l.principal_amount, l.book_loan_number, l.pledge_date
-            FROM Loans l JOIN Customers c ON l.customer_id = c.id
-            WHERE l.status = 'overdue' ORDER BY l.due_date ASC`;
-         const alreadyOverdueLoans = await db.query(alreadyOverdueQuery);
-         return res.json(alreadyOverdueLoans.rows); // Return previously marked overdue loans
-    }
-
-    res.json(overdueLoans); // Return the loans found in Step 1
-
+      SELECT l.id, l.due_date, c.name AS customer_name, l.principal_amount, l.book_loan_number, l.pledge_date
+      FROM Loans l JOIN Customers c ON l.customer_id = c.id
+      WHERE l.status = 'overdue'
+      ORDER BY l.due_date ASC`;
+    const overdueLoans = await db.query(query);
+    res.json(overdueLoans.rows);
   } catch (err) {
     console.error("OVERDUE LOANS API ERROR:", err.message);
     res.status(500).send("Server Error");
   }
 });
 
-// FIND a loan by its book loan number
-app.get('/api/loans/find-by-book-number/:bookNumber', async (req, res) => {
+// FIND a loan by book number
+app.get('/api/loans/find-by-book-number/:bookNumber', authenticateToken, async (req, res) => {
   try {
     const { bookNumber } = req.params;
     const result = await db.query("SELECT id FROM Loans WHERE book_loan_number = $1", [bookNumber]);
@@ -196,12 +246,12 @@ app.get('/api/loans/find-by-book-number/:bookNumber', async (req, res) => {
   }
 });
 
-// === GET A SINGLE LOAN (ENHANCED: Fetches Customer Details) ===
-app.get('/api/loans/:id', async (req, res) => {
+// GET a single loan by ID (Defined after specific routes)
+app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   try {
-    const { id } = req.params;
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) return res.status(400).json({ error: "Invalid loan ID." });
 
-    // 1. Join Loans, PledgedItems, AND Customers tables
     const loanQuery = `
       SELECT 
         l.*, 
@@ -209,15 +259,14 @@ app.get('/api/loans/:id', async (req, res) => {
         c.name AS customer_name, c.phone_number, c.customer_image_url
       FROM Loans l 
       LEFT JOIN PledgedItems pi ON l.id = pi.loan_id 
-      JOIN Customers c ON l.customer_id = c.id
+      JOIN Customers c ON l.customer_id = c.id 
       WHERE l.id = $1`;
-
+    
     const loanResult = await db.query(loanQuery, [id]);
     if (loanResult.rows.length === 0) return res.status(404).json({ error: "Loan not found." });
 
     let loanDetails = loanResult.rows[0];
-
-    // 2. Convert ITEM image BYTEA to Base64 Data URL
+    
     if (loanDetails.item_image_data) {
       const imageBase64 = loanDetails.item_image_data.toString('base64');
       let mimeType = 'image/jpeg';
@@ -225,9 +274,8 @@ app.get('/api/loans/:id', async (req, res) => {
       else if (imageBase64.startsWith('iVBORw0KGgo')) mimeType = 'image/png';
       loanDetails.item_image_data_url = `data:${mimeType};base64,${imageBase64}`;
     }
-    delete loanDetails.item_image_data; // Clean up buffer
-
-    // 3. Convert CUSTOMER image BYTEA to Base64 Data URL
+    delete loanDetails.item_image_data;
+    
     if (loanDetails.customer_image_url) {
       const imageBase64 = loanDetails.customer_image_url.toString('base64');
       let mimeType = 'image/jpeg';
@@ -238,6 +286,7 @@ app.get('/api/loans/:id', async (req, res) => {
 
     const transactionsResult = await db.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date DESC", [id]);
     res.json({ loanDetails: loanDetails, transactions: transactionsResult.rows });
+
   } catch (err) {
     console.error("GET Loan Details Error:", err.message);
     res.status(500).send("Server Error");
@@ -245,7 +294,7 @@ app.get('/api/loans/:id', async (req, res) => {
 });
 
 // CREATE a new loan
-app.post('/api/loans', upload.single('itemPhoto'), async (req, res) => {
+app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req, res) => {
   const client = await db.pool.connect();
   try {
     const { customer_id, principal_amount, interest_rate, book_loan_number, item_type, description, quality, weight } = req.body;
@@ -267,26 +316,37 @@ app.post('/api/loans', upload.single('itemPhoto'), async (req, res) => {
 });
 
 // GET all loans for a specific customer
-app.get('/api/customers/:id/loans', async (req, res) => {
+app.get('/api/customers/:id/loans', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
-    const query = `SELECT l.id AS loan_id, l.principal_amount, l.pledge_date, l.due_date, pi.description, CASE WHEN l.status = 'paid' THEN 'paid' WHEN l.status = 'forfeited' THEN 'forfeited' WHEN l.status = 'overdue' THEN 'overdue' ELSE 'active' END AS status FROM Loans l LEFT JOIN PledgedItems pi ON l.id = pi.loan_id WHERE l.customer_id = $1 ORDER BY l.pledge_date DESC`;
+    const query = `
+      SELECT l.id AS loan_id, l.principal_amount, l.pledge_date, l.due_date, pi.description,
+      CASE WHEN l.status = 'paid' THEN 'paid' WHEN l.status = 'forfeited' THEN 'forfeited' WHEN l.status = 'overdue' THEN 'overdue' ELSE 'active' END AS status
+      FROM Loans l LEFT JOIN PledgedItems pi ON l.id = pi.loan_id
+      WHERE l.customer_id = $1 ORDER BY l.pledge_date DESC`;
     const customerLoans = await db.query(query, [id]);
     res.json(customerLoans.rows);
-  } catch (err) { console.error("GET Customer Loans Error:", err.message); res.status(500).send("Server Error"); }
+  } catch (err) {
+    console.error("GET Customer Loans Error:", err.message);
+    res.status(500).send("Server Error");
+  }
 });
 
-// --- TRANSACTION & SETTLEMENT ---
-app.post('/api/transactions', async (req, res) => {
+// --- TRANSACTION & SETTLEMENT (Protected) ---
+app.post('/api/transactions', authenticateToken, async (req, res) => {
   try {
     const { loan_id, amount_paid, payment_type } = req.body;
     if (!loan_id || !amount_paid) return res.status(400).json({ error: 'Loan ID and amount are required.' });
     const newTransaction = await db.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type) VALUES ($1, $2, $3) RETURNING *", [loan_id, amount_paid, payment_type || 'payment']);
     res.status(201).json(newTransaction.rows[0]);
-  } catch (err) { console.error("POST Transaction Error:", err.message); res.status(500).send("Server Error"); }
+  } catch (err) {
+    console.error("POST Transaction Error:", err.message);
+    res.status(500).send("Server Error");
+  }
 });
-app.post('/api/loans/:id/settle', async (req, res) => {
+
+app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { discountAmount } = req.body;
@@ -307,11 +367,14 @@ app.post('/api/loans/:id/settle', async (req, res) => {
     if (finalBalance > 1) return res.status(400).json({ error: `Cannot close loan. After a discount of ₹${discount.toFixed(2)}, an outstanding balance of ₹${finalBalance.toFixed(2)} still remains.` });
     const closeLoan = await db.query("UPDATE Loans SET status = 'paid' WHERE id = $1 RETURNING *", [id]);
     res.json({ message: `Loan successfully closed with a discount of ₹${discount.toFixed(2)}.`, loan: closeLoan.rows[0] });
-  } catch (err) { console.error("Settle Loan Error:", err.message); res.status(500).send("Server Error"); }
+  } catch (err) {
+    console.error("Settle Loan Error:", err.message);
+    res.status(500).send("Server Error");
+  }
 });
 
-// --- DASHBOARD ROUTE ---
-app.get('/api/dashboard/stats', async (req, res) => {
+// --- DASHBOARD ROUTES (Protected) ---
+app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
   try {
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
     const activePromise = db.query("SELECT COUNT(*) FROM Loans WHERE status = 'active' OR status = 'overdue'");
@@ -319,7 +382,30 @@ app.get('/api/dashboard/stats', async (req, res) => {
     const overduePromise = db.query("SELECT COUNT(*) FROM Loans WHERE status = 'overdue'");
     const [active, disbursed, overdue] = await Promise.all([activePromise, disbursedPromise, overduePromise]);
     res.json({ active_loans: active.rows[0].count, total_disbursed: disbursed.rows[0].sum || 0, overdue_loans: overdue.rows[0].count });
-  } catch (err) { console.error("Dashboard Stats Error:", err.message); res.status(500).send("Server Error"); }
+  } catch (err) {
+    console.error("Dashboard Stats Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
+app.get('/api/loans/recent/created', authenticateToken, async (req, res) => {
+  try {
+    const query = `SELECT l.id, l.principal_amount, c.name AS customer_name FROM Loans l LEFT JOIN Customers c ON l.customer_id = c.id ORDER BY l.created_at DESC LIMIT 5`;
+    res.json((await db.query(query)).rows);
+  } catch (err) {
+    console.error("Recent Created Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
+app.get('/api/loans/recent/closed', authenticateToken, async (req, res) => {
+  try {
+    const query = `SELECT l.id, l.principal_amount, c.name AS customer_name FROM Loans l LEFT JOIN Customers c ON l.customer_id = c.id WHERE l.status = 'paid' ORDER BY l.created_at DESC LIMIT 5`;
+    res.json((await db.query(query)).rows);
+  } catch (err) {
+    console.error("Recent Closed Error:", err.message);
+    res.status(500).send("Server Error");
+  }
 });
 
 // --- START THE SERVER ---
