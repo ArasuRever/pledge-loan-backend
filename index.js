@@ -10,7 +10,7 @@ require('dotenv').config();
 const app = express();
 app.use(cors());
 app.use(express.json());
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'a-very-strong-secret-key-that-you-should-change';
 
 // --- MULTER CONFIGURATION (Using memoryStorage for BYTEA storage) ---
@@ -704,6 +704,6 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
 
 
 // --- START THE SERVER ---
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server is running on port ${PORT}`);
 });
