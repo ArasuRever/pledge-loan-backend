@@ -157,6 +157,14 @@ app.post('/api/customers', authenticateToken, upload.single('photo'), async (req
 });
 
 app.put('/api/customers/:id', authenticateToken, upload.single('photo'), async (req, res) => {
+
+  // --- ADD LOGGING HERE ---
+        console.log("-----> AFTER MULTER <-----");
+        console.log("       req.body:", req.body);
+        console.log("       req.file:", req.file ? req.file.originalname : 'No file');
+        console.log("--------------------------");
+        // --- END ADD LOGGING ---
+        
     try {
         const id = parseInt(req.params.id);
         if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
