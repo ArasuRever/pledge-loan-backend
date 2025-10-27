@@ -545,7 +545,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
                 l.book_loan_number, l.interest_rate, l.pledge_date, l.due_date,
                 pi.id AS item_id, pi.item_type, pi.description, pi.quality, pi.weight, pi.item_image_data
             FROM "loans" l
-            LEFT JOIN "pledgeditems" pi ON l.id = pi.loan_id
+            INNER JOIN "pledgeditems" pi ON l.id = pi.loan_id
             WHERE l.id = $1
             FOR UPDATE OF l, pi; -- Lock rows for update
         `;
