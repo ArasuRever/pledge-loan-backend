@@ -112,6 +112,13 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/customers/:id', authenticateToken, async (req, res) => {
+
+  // --- Add Logs ---
+    console.log(`---> Received PUT /api/customers/${req.params.id}`); // Log entry point
+    console.log("    Request Body:", req.body);
+    console.log("    Request File:", req.file ? req.file.originalname : 'No file');
+    // --- End Add Logs ---
+
   try {
     const id = parseInt(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
@@ -171,7 +178,18 @@ app.put('/api/customers/:id', authenticateToken, upload.single('photo'), async (
         const updateCustomerResult = await db.query(query, values);
         if (updateCustomerResult.rows.length === 0) return res.status(404).json({ error: "Customer not found." });
         res.json(updateCustomerResult.rows[0]);
-    } catch (err) { console.error("PUT Customer Error:", err.message); res.status(500).send("Server Error"); }
+    } 
+    catch (err) { // --- Make Error Logging More Visible ---
+        console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        console.error("!!!! ERROR IN PUT /api/customers/:id !!!!");
+        console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        console.error("Error Message:", err.message);
+        console.error("Error Code:", err.code);
+        console.error("Error Detail:", err.detail);
+        console.error("Stack Trace:", err.stack); // Log the full stack
+        // --- End Make Error Logging More Visible ---
+        res.status(500).json({ error: "Server Error during update.", details: err.message });
+       }
 });
 
 // --- LOAN ROUTES (Protected & Ordered Correctly) ---
