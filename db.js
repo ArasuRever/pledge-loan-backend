@@ -5,7 +5,8 @@ require('dotenv').config(); // Keep dotenv for local development
 // Check if we are in the production (Render) environment
 const isProduction = process.env.NODE_ENV === 'production';
 
-const connectionString = process.env.DATABASE_URL; // This is the URL Render provides
+// This is the URL Render provides in its environment variables
+const connectionString = process.env.DATABASE_URL;
 
 // Use Render's connection string in production, otherwise use local .env variables
 const pool = new Pool({
