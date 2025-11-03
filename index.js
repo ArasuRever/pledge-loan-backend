@@ -143,7 +143,7 @@ app.get('/api/customers/:id', authenticateToken, async (req, res) => {
 app.post('/api/customers', authenticateToken, upload.single('photo'), async (req, res) => {
   try {
     const { name, phone_number, address } = req.body;
-    const imageBuffer = req.file ? req.file.buffer : null;
+    const imageBuffer = (req.files && req.files.length > 0) ? req.files[0].buffer : null;
     if (!name || !phone_number) return res.status(400).json({ error: 'Name and phone are required.' });
     const newCustomerResult = await db.query(
       "INSERT INTO Customers (name, phone_number, address, customer_image_url) VALUES ($1, $2, $3, $4) RETURNING id, name, phone_number, address",
@@ -156,7 +156,7 @@ app.post('/api/customers', authenticateToken, upload.single('photo'), async (req
   }
 });
 
-app.put('/api/customers/:id', authenticateToken, upload.single('photo'), async (req, res) => {
+app.put('/api/customers/:id', authenticateToken, upload.single(), async (req, res) => {
 
   // --- ADD LOGGING HERE ---
         console.log("-----> AFTER MULTER <-----");
@@ -172,7 +172,7 @@ app.put('/api/customers/:id', authenticateToken, upload.single('photo'), async (
         let imageBuffer = null;
         let updateImage = false;
 
-        if (req.file) { imageBuffer = req.file.buffer; updateImage = true; }
+        if (req.files && req.files.length > 0) { imageBuffer = req.files[0].buffer; updateImage = true; }
         else if (req.body.removeCurrentImage === 'true') { imageBuffer = null; updateImage = true; }
 
         let query; let values;
