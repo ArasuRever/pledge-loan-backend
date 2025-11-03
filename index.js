@@ -573,7 +573,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
             FROM "loans" l
             INNER JOIN "pledgeditems" pi ON l.id = pi.loan_id
             WHERE l.id = $1
-            FOR UPDATE OF l, pi; -- Lock rows for update
+            FOR UPDATE OF l; -- Lock rows for update
         `;
         const currentResult = await client.query(currentDataQuery, [loanId]);
 
