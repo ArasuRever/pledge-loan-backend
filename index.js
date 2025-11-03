@@ -19,6 +19,11 @@ const upload = multer({ storage: storage });
 
 // --- AUTHENTICATION MIDDLEWARE ---
 const authenticateToken = (req, res, next) => {
+  // Allow preflight OPTIONS requests to pass through
+  if (req.method === 'OPTIONS') {
+    return next();
+  }
+
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1]; // Format: "Bearer TOKEN"
 
@@ -169,8 +174,15 @@ app.put('/api/customers/:id', authenticateToken, upload.single(), async (req, re
         const id = parseInt(req.params.id);
         if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
         const { name, phone_number, address } = req.body;
-        let imageBuffer = null;
-        let updateImage = false;
+                  // [NEW CODE]
+          let imageBuffer = null;
+          let updateImage = false;
+
+          // Check req.files (array) instead of req.file (object)
+          if (req.files && req.files.length > 0) { 
+            imageBuffer = req.files[0].buffer; 
+            updateImage = true; 
+          }
 
         if (req.files && req.files.length > 0) { imageBuffer = req.files[0].buffer; updateImage = true; }
         else if (req.body.removeCurrentImage === 'true') { imageBuffer = null; updateImage = true; }
