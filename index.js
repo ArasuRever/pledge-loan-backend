@@ -19,7 +19,7 @@ const upload = multer({ storage: storage });
 
 // --- AUTHENTICATION MIDDLEWARE ---
 const authenticateToken = (req, res, next) => {
-  // Allow preflight OPTIONS requests to pass through
+  // *** FIX 1: Allow OPTIONS preflight request for CORS ***
   if (req.method === 'OPTIONS') {
     return next();
   }
@@ -119,9 +119,7 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
 app.get('/api/customers/:id', authenticateToken, async (req, res) => {
 
   // --- Add Logs ---
-    console.log(`---> Received PUT /api/customers/${req.params.id}`); // Log entry point
-    console.log("    Request Body:", req.body);
-    console.log("    Request File:", req.file ? req.file.originalname : 'No file');
+    console.log(`---> Received GET /api/customers/${req.params.id}`); // Corrected Log
     // --- End Add Logs ---
 
   try {
@@ -148,7 +146,7 @@ app.get('/api/customers/:id', authenticateToken, async (req, res) => {
 app.post('/api/customers', authenticateToken, upload.single('photo'), async (req, res) => {
   try {
     const { name, phone_number, address } = req.body;
-    const imageBuffer = (req.files && req.files.length > 0) ? req.files[0].buffer : null;
+    const imageBuffer = req.file ? req.file.buffer : null;
     if (!name || !phone_number) return res.status(400).json({ error: 'Name and phone are required.' });
     const newCustomerResult = await db.query(
       "INSERT INTO Customers (name, phone_number, address, customer_image_url) VALUES ($1, $2, $3, $4) RETURNING id, name, phone_number, address",
@@ -161,12 +159,14 @@ app.post('/api/customers', authenticateToken, upload.single('photo'), async (req
   }
 });
 
-app.put('/api/customers/:id', authenticateToken, upload.single(), async (req, res) => {
+// *** FIX 2: Corrected PUT /api/customers/:id route ***
+app.put('/api/customers/:id', authenticateToken, upload.any(), async (req, res) => {
 
   // --- ADD LOGGING HERE ---
         console.log("-----> AFTER MULTER <-----");
         console.log("       req.body:", req.body);
-        console.log("       req.file:", req.file ? req.file.originalname : 'No file');
+        // Use req.files (array)
+        console.log("       req.file:", (req.files && req.files.length > 0) ? req.files[0].originalname : 'No file');
         console.log("--------------------------");
         // --- END ADD LOGGING ---
         
@@ -174,18 +174,18 @@ app.put('/api/customers/:id', authenticateToken, upload.single(), async (req, re
         const id = parseInt(req.params.id);
         if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
         const { name, phone_number, address } = req.body;
-                  // [NEW CODE]
-          let imageBuffer = null;
-          let updateImage = false;
+        let imageBuffer = null;
+        let updateImage = false;
 
-          // Check req.files (array) instead of req.file (object)
-          if (req.files && req.files.length > 0) { 
+        // Check req.files (array) instead of req.file
+        if (req.files && req.files.length > 0) { 
             imageBuffer = req.files[0].buffer; 
             updateImage = true; 
-          }
-
-        if (req.files && req.files.length > 0) { imageBuffer = req.files[0].buffer; updateImage = true; }
-        else if (req.body.removeCurrentImage === 'true') { imageBuffer = null; updateImage = true; }
+        }
+        else if (req.body.removeCurrentImage === 'true') { 
+            imageBuffer = null; 
+            updateImage = true; 
+        }
 
         let query; let values;
         if (updateImage) {
@@ -578,6 +578,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
         await client.query('BEGIN');
 
         // --- 1. Fetch current loan and item data ---
+        // This query already contains the fix from earlier
         const currentDataQuery = `
             SELECT
                 l.book_loan_number, l.interest_rate, l.pledge_date, l.due_date,
@@ -716,9 +717,13 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
 
 
 // GET a single loan by ID (Keep this AFTER the specific /edit and /history routes)
+// This route was duplicated in your original file, I'm keeping the one at the top (line 327)
+// and removing this duplicate one.
+/*
 app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   // ... (existing code for this route) ...
 });
+*/
 
 
 // --- DASHBOARD ROUTES (Protected) ---
