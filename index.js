@@ -9,22 +9,13 @@ require('dotenv').config();
 
 const app = express();
 
-// --- START CORS CONFIGURATION FIX ---
-// Define explicit CORS options
-const corsOptions = {
-  origin: 'https://pledge-loan-frontend.onrender.com', // Your frontend URL
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], // Allow PUT and OPTIONS
-  allowedHeaders: ['Content-Type', 'Authorization'], // Allow these headers
-  optionsSuccessStatus: 200 // Respond with 200 to OPTIONS requests
-};
-
-// Use the explicit CORS options
-app.use(cors(corsOptions));
-
-// Add this line: Explicitly handle all preflight OPTIONS requests
-// This will intercept OPTIONS requests *before* your auth middleware
-app.options('*', cors(corsOptions));
-// --- END CORS CONFIGURATION FIX ---
+// --- START NEW CORS FIX ---
+// Use the default, wide-open CORS configuration.
+// This allows ALL origins and ALL methods.
+app.use(cors());
+// Also explicitly handle all preflight OPTIONS requests
+app.options('*', cors());
+// --- END NEW CORS FIX ---
 
 
 app.use(express.json());
@@ -36,8 +27,7 @@ const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
 // --- AUTHENTICATION MIDDLEWARE ---
-// We can remove the "if (req.method === 'OPTIONS')" fix now
-// because app.options('*', cors()) handles it above.
+// The app.options handler above will now catch preflights before this.
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1]; // Format: "Bearer TOKEN"
@@ -73,10 +63,8 @@ app.post('/api/auth/register', async (req, res) => {
     if (!username || !password) {
       return res.status(400).send('Username and password are required.');
     }
-
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-
     const newUser = await db.query(
       "INSERT INTO Users (username, password) VALUES ($1, $2) RETURNING id, username",
       [username, hashedPassword]
@@ -97,26 +85,21 @@ app.post('/api/auth/login', async (req, res) => {
     if (!username || !password) {
       return res.status(400).send('Username and password are required.');
     }
-
     const userResult = await db.query("SELECT * FROM Users WHERE username = $1", [username]);
     if (userResult.rows.length === 0) {
       return res.status(401).send('Invalid credentials.');
     }
     const user = userResult.rows[0];
-
     const validPassword = await bcrypt.compare(password, user.password);
     if (!validPassword) {
       return res.status(401).send('Invalid credentials.');
     }
-
     const token = jwt.sign(
       { userId: user.id, username: user.username },
       JWT_SECRET,
       { expiresIn: '8h' }
     );
-
     res.json({ token });
-
   } catch (err) {
     console.error("Login Error:", err.message);
     res.status(500).send('Server error during login.');
@@ -132,7 +115,7 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/customers/:id', authenticateToken, async (req, res) => {
-    console.log(`---> Received GET /api/customers/${req.params.id}`);
+  console.log(`---> Received GET /api/customers/${req.params.id}`);
   try {
     const id = parseInt(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
@@ -169,18 +152,25 @@ app.post('/api/customers', authenticateToken, upload.single('photo'), async (req
   }
 });
 
-// *** FIX 2: Corrected PUT /api/customers/:id route ***
+// *** THIS IS THE MULTER FIX ***
 app.put('/api/customers/:id', authenticateToken, upload.any(), async (req, res) => {
-
-        console.log("-----> AFTER MULTER <-----");
-        console.log("       req.body:", req.body);
-        console.log("       req.file:", (req.files && req.files.length > 0) ? req.files[0].originalname : 'No file');
-        console.log("--------------------------");
+    console.log("-----> PUT /api/customers/:id <-----");
+    console.log("       req.body:", req.body); // Should NOT be empty
+    console.log("       req.files:", (req.files && req.files.length > 0) ? `${req.files.length} file(s)` : 'No files');
+    console.log("---------------------------------");
         
     try {
         const id = parseInt(req.params.id);
         if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
+        
         const { name, phone_number, address } = req.body;
+        
+        // Add check for missing data (which would happen if req.body was empty)
+        if (!name || !phone_number) {
+            console.error("Error: Name or phone number is missing from req.body.");
+            return res.status(400).json({ error: 'Name and phone number are required.' });
+        }
+        
         let imageBuffer = null;
         let updateImage = false;
 
@@ -203,22 +193,13 @@ app.put('/api/customers/:id', authenticateToken, upload.any(), async (req, res) 
             values = [name, phone_number, address, id];
         }
         
-        // Add a check for empty name/phone
-        if (!name || !phone_number) {
-            return res.status(400).json({ error: "Name and phone number are required." });
-        }
-        
         const updateCustomerResult = await db.query(query, values);
         if (updateCustomerResult.rows.length === 0) return res.status(404).json({ error: "Customer not found." });
         res.json(updateCustomerResult.rows[0]);
     } 
     catch (err) {
-        console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
         console.error("!!!! ERROR IN PUT /api/customers/:id !!!!");
-        console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
         console.error("Error Message:", err.message);
-        console.error("Error Code:", err.code);
-        console.error("Error Detail:", err.detail);
         console.error("Stack Trace:", err.stack);
         res.status(500).json({ error: "Server Error during update.", details: err.message });
        }
@@ -317,6 +298,7 @@ app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => 
   } finally { client.release(); }
 });
 
+
 app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
@@ -333,18 +315,18 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   } catch (err) { console.error("GET Loan Details Error:", err.message); res.status(500).send("Server Error"); }
 });
 
+
 app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req, res) => {
   const client = await db.pool.connect();
   try {
     const { customer_id, principal_amount, interest_rate, book_loan_number, item_type, description, quality, weight } = req.body;
     const itemImageBuffer = req.file ? req.file.buffer : null;
     const principal = parseFloat(principal_amount);
-    const rate = parseFloat(interest_rate);
+    const rate = parseFloat(interest_rate); 
 
     if (!customer_id || isNaN(principal) || principal <= 0 || isNaN(rate) || rate <= 0 || !book_loan_number || !item_type || !description) {
          return res.status(400).send("Missing or invalid required loan/item fields (customer, principal, rate, book#, type, description).");
     }
-
     await client.query('BEGIN');
     const loanQuery = `INSERT INTO Loans (customer_id, principal_amount, interest_rate, book_loan_number) VALUES ($1, $2, $3, $4) RETURNING id`;
     const loanResult = await client.query(loanQuery, [customer_id, principal, rate, book_loan_number]);
@@ -363,6 +345,7 @@ app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req
   } finally { client.release(); }
 });
 
+
 app.get('/api/customers/:id/loans', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
@@ -379,8 +362,8 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
   try {
     const { loan_id, amount_paid, payment_type } = req.body;
     if (!loan_id || !amount_paid || parseFloat(amount_paid) <= 0) { return res.status(400).json({ error: 'Valid Loan ID and positive amount required.' }); }
-    const validPaymentTypes = ['interest', 'principal'];
-    const finalPaymentType = validPaymentTypes.includes(payment_type) ? payment_type : 'payment';
+    const validPaymentTypes = ['interest', 'principal']; 
+    const finalPaymentType = validPaymentTypes.includes(payment_type) ? payment_type : 'payment'; 
     const newTransaction = await db.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type) VALUES ($1, $2, $3) RETURNING *", [loan_id, amount_paid, finalPaymentType]);
     res.status(201).json(newTransaction.rows[0]);
   } catch (err) {
@@ -460,7 +443,7 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
     );
     
     let totalInterest = 0;
-    let maxMonthsFactor = 0;
+    let maxMonthsFactor = 0; 
 
     for (const event of disbursementEvents) {
         if (event.amount <= 0) continue;
@@ -492,17 +475,17 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
   }
 });
 
-// *** NEW: UPDATE AN EXISTING LOAN ***
+// *** UPDATE AN EXISTING LOAN (Includes FOR UPDATE fix) ***
 app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (req, res) => {
     const { id } = req.params;
     const loanId = parseInt(id);
-    const username = req.user.username;
+    const username = req.user.username; 
 
     const {
         book_loan_number, interest_rate, pledge_date, due_date,
         item_type, description, quality, weight
     } = req.body;
-    const newItemImageBuffer = req.file ? req.file.buffer : undefined;
+    const newItemImageBuffer = req.file ? req.file.buffer : undefined; 
     const removeItemImage = req.body.removeItemImage === 'true';
 
     if (isNaN(loanId) || loanId <= 0) {
@@ -513,7 +496,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
     try {
         await client.query('BEGIN');
 
-        // *** THIS IS THE FIX FROM EARLIER FOR THE "FOR UPDATE" ERROR ***
+        // *** THIS IS THE "FOR UPDATE" FIX ***
         const currentDataQuery = `
             SELECT
                 l.book_loan_number, l.interest_rate, l.pledge_date, l.due_date,
@@ -530,14 +513,14 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
             return res.status(404).json({ error: "Loan not found." });
         }
         const oldData = currentResult.rows[0];
-        const itemId = oldData.item_id;
+        const itemId = oldData.item_id; 
 
         const historyLogs = [];
         const loanUpdateFields = [];
         const loanUpdateValues = [];
         const itemUpdateFields = [];
         const itemUpdateValues = [];
-        let valueIndex = 1;
+        let valueIndex = 1; 
 
         const addUpdate = (table, field, newValue, oldValue, fieldsArray, valuesArray, logLabel = field) => {
             const oldValueStr = oldValue instanceof Date ? oldValue.toISOString().split('T')[0] : String(oldValue ?? '');
@@ -574,13 +557,13 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
         }
 
         if (loanUpdateFields.length > 0) {
-            loanUpdateValues.push(loanId);
+            loanUpdateValues.push(loanId); 
             const loanUpdateQuery = `UPDATE "loans" SET ${loanUpdateFields.join(', ')} WHERE id = $${valueIndex}`;
             await client.query(loanUpdateQuery, loanUpdateValues);
             console.log(`Updated loan ${loanId}`);
         }
         if (itemUpdateFields.length > 0 && itemId) {
-            itemUpdateValues.push(itemId);
+            itemUpdateValues.push(itemId); 
             const itemUpdateQuery = `UPDATE "pledgeditems" SET ${itemUpdateFields.join(', ')} WHERE id = $${valueIndex}`;
             await client.query(itemUpdateQuery, itemUpdateValues);
             console.log(`Updated pledged item ${itemId} for loan ${loanId}`);
@@ -603,7 +586,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
     } catch (err) {
         await client.query('ROLLBACK');
         console.error(`Error updating loan ${loanId}:`, err.message);
-        if (err.code === '23505' && err.constraint === 'loans_book_loan_number_key') {
+        if (err.code === '23505' && err.constraint === 'loans_book_loan_number_key') { 
              return res.status(400).json({ error: "Book Loan Number already exists." });
         }
         res.status(500).send("Server Error while updating loan.");
@@ -635,7 +618,6 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
     }
 });
 
-// --- DASHBOARD ROUTES (Protected) ---
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
   try {
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
