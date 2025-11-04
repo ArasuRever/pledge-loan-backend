@@ -8,9 +8,36 @@ const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
-app.use(cors());
+
+// --- ⭐ 1. CONFIGURE CORS FOR PRODUCTION ---
+// List of allowed origins (your frontend URLs)
+const allowedOrigins = [
+  'http://localhost:3000', // For local development
+  'https://your-frontend-service-name.onrender.com' // <-- ⚠️ REPLACE THIS
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps, curl, or Postman)
+    if (!origin) return callback(null, true);
+    
+    // Check if the origin is in our allowed list
+    if (allowedOrigins.indexOf(origin) === -1) {
+      const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  }
+}));
+// --- END CORS CONFIG ---
+
 app.use(express.json());
-const PORT = 3001;
+
+// --- ⭐ 2. USE RENDER'S PORT ---
+// Render provides its port via the PORT environment variable
+const PORT = process.env.PORT || 3001; 
+// --- END PORT FIX ---
+
 const JWT_SECRET = process.env.JWT_SECRET || 'a-very-strong-secret-key-that-you-should-change';
 
 // --- MULTER CONFIGURATION (Using memoryStorage for BYTEA storage) ---
