@@ -13,7 +13,8 @@ const app = express();
 // List of allowed origins (your frontend URLs)
 const allowedOrigins = [
   'http://localhost:3000', // For local development
-  'https://pledge-loan-frontend.onrender.com' // <-- ⚠️ REPLACE THIS
+  'https://pledge-loan-frontend.onrender.com',
+  'exp://192.168.29.6:8081'
 ];
 
 app.use(cors({
