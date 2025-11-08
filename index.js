@@ -108,6 +108,104 @@ app.post('/api/auth/register', authenticateToken, authorizeAdmin, async (req, re
   }
 });
 
+// --- USER MANAGEMENT ROUTES (Admin Only) ---
+
+// 1. Get all users
+app.get('/api/users', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    // Select all users but EXCLUDE their passwords
+    const users = await db.query("SELECT id, username, role FROM users ORDER BY id ASC");
+    res.json(users.rows);
+  } catch (err) {
+    console.error("GET Users Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
+// 2. Create a new staff user
+app.post('/api/users/staff', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).send('Username and password are required.');
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    // Explicitly set the role as 'staff'
+    const newUser = await db.query(
+      "INSERT INTO users (username, password, role) VALUES ($1, $2, 'staff') RETURNING id, username, role",
+      [username, hashedPassword]
+    );
+    res.status(201).json(newUser.rows[0]);
+  } catch (err) {
+    if (err.code === '23505') { // Handle duplicate username
+      return res.status(400).send('Username already exists.');
+    }
+    console.error("Create Staff Error:", err.message);
+    res.status(500).send('Server error during staff creation.');
+  }
+});
+
+// 3. Change any user's password
+app.put('/api/users/change-password', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const { userId, newPassword } = req.body;
+    if (!userId || !newPassword) {
+      return res.status(400).send('User ID and new password are required.');
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+    const result = await db.query(
+      "UPDATE users SET password = $1 WHERE id = $2 RETURNING id, username",
+      [hashedPassword, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).send('User not found.');
+    }
+
+    res.status(200).json({ message: `Password for ${result.rows[0].username} updated successfully.` });
+  } catch (err) {
+    console.error("Change Password Error:", err.message);
+    res.status(500).send('Server error changing password.');
+  }
+});
+
+// 4. Delete a staff user
+app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = parseInt(id);
+
+    if (isNaN(userId)) {
+      return res.status(400).send('Invalid user ID.');
+    }
+
+    // Safety check: Do not allow an admin to delete their own account via this route
+    if (userId === req.user.userId) {
+      return res.status(400).send('Admin users cannot delete their own account.');
+    }
+
+    // Only allow deleting staff members
+    const result = await db.query("DELETE FROM users WHERE id = $1 AND role = 'staff' RETURNING id, username", [userId]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).send('Staff user not found or user is not a staff member.');
+    }
+
+    res.status(200).json({ message: `Staff user ${result.rows[0].username} deleted successfully.` });
+  } catch (err) {
+    console.error("Delete Staff Error:", err.message);
+    res.status(500).send('Server error deleting user.');
+  }
+});
+
+// --- END USER MANAGEMENT ROUTES ---
+
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
