@@ -773,10 +773,12 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
 
 // --- DASHBOARD ROUTES (Protected) ---
 // --- ⭐ CHANGED: Added authorizeAdmin to protect this route ---
+// --- DASHBOARD ROUTES (Protected) ---
 app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
 
+    // 1. Queries for the React Web App
     const principalPromise = db.query(
       "SELECT SUM(principal_amount) FROM Loans WHERE status = 'active' OR status = 'overdue'"
     );
@@ -790,23 +792,39 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
       "SELECT SUM(amount_paid) FROM Transactions WHERE payment_type = 'interest' AND payment_date >= date_trunc('month', CURRENT_DATE)"
     );
 
+    // 2. NEW Queries for the Flutter Mobile App
+    const totalCustomersPromise = db.query("SELECT COUNT(*) FROM Customers");
+    const totalLoansPromise = db.query("SELECT COUNT(*) FROM Loans"); // Counts *all* loans
+
+    // 3. Wait for ALL queries to finish
     const [
       principalResult,
       activeLoansResult,
       overdueLoansResult,
-      interestThisMonthResult
+      interestThisMonthResult,
+      totalCustomersResult, // New result
+      totalLoansResult      // New result
     ] = await Promise.all([
       principalPromise,
       activeLoansPromise,
       overdueLoansPromise,
-      interestThisMonthPromise
+      interestThisMonthPromise,
+      totalCustomersPromise, // New query
+      totalLoansPromise      // New query
     ]);
 
+    // 4. Build the combined stats object
     const stats = {
+      // --- Keys for React Web App ---
       totalPrincipalOut: parseFloat(principalResult.rows[0].sum) || 0,
       totalActiveLoans: parseInt(activeLoansResult.rows[0].count) || 0,
       totalOverdueLoans: parseInt(overdueLoansResult.rows[0].count) || 0,
-      interestCollectedThisMonth: parseFloat(interestThisMonthResult.rows[0].sum) || 0
+      interestCollectedThisMonth: parseFloat(interestThisMonthResult.rows[0].sum) || 0,
+
+      // --- New Keys for Flutter Mobile App ---
+      totalCustomers: parseInt(totalCustomersResult.rows[0].count) || 0,
+      totalLoans: parseInt(totalLoansResult.rows[0].count) || 0,
+      totalValue: parseFloat(principalResult.rows[0].sum) || 0 // Re-using the same value as 'totalPrincipalOut'
     };
 
     res.json(stats);
