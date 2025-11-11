@@ -208,11 +208,11 @@ app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res)
 
 // --- This is the corrected login route ---
 app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    if (!username || !password) {
-      return res.status(400).send('Username and password are required.');
-    }
+   try {
+   const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).send('Username and password are required.');
+    }
 
     const userResult = await db.query("SELECT * FROM users WHERE username = $1", [username]);
     if (userResult.rows.length === 0) {
@@ -220,8 +220,13 @@ app.post('/api/auth/login', async (req, res) => {
     }
     const user = userResult.rows[0];
 
-    // --- FIX: Use password_hash from your other backend file ---
-    const validPassword = await bcrypt.compare(password, user.password_hash); 
+    // --- 1. FIX: Change this back to user.password ---
+    // Make sure the 'password' column in your 'users' table is not null
+    if (!user.password) {
+        console.error(`User ${username} has no password set in the database.`);
+        return res.status(401).send('Invalid credentials.');
+    }
+    const validPassword = await bcrypt.compare(password, user.password); 
     if (!validPassword) {
       return res.status(401).send('Invalid credentials.');
     }
@@ -231,10 +236,10 @@ app.post('/api/auth/login', async (req, res) => {
     const token = jwt.sign(
       { userId: user.id, username: user.username, role: user.role },
       JWT_SECRET,
-      { expiresIn: '30d' } // <-- Keeps the 30-day fix
+      { expiresIn: '30d' } // Keeps the 30-day fix
     );
 
-    // --- FIX: Send both the token AND the user object ---
+    // --- 2. FIX: Send both the token AND the user object ---
     res.json({ 
         token: token,
         user: {
