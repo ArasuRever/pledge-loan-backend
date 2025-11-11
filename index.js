@@ -208,34 +208,34 @@ app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res)
 
 // --- This is the corrected login route ---
 app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    if (!username || !password) {
-    return res.status(400).send('Username and password are required.');
-    }
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).send('Username and password are required.');
+    }
 
-   const userResult = await db.query("SELECT * FROM users WHERE username = $1", [username]);
-     if (userResult.rows.length === 0) {
-      return res.status(401).send('Invalid credentials.');
-   }
-   const user = userResult.rows[0];
+    const userResult = await db.query("SELECT * FROM users WHERE username = $1", [username]);
+    if (userResult.rows.length === 0) {
+      return res.status(401).send('Invalid credentials.');
+    }
+    const user = userResult.rows[0];
 
     // Use the correct 'password' column from your file
-   const validPassword = await bcrypt.compare(password, user.password); 
-     if (!validPassword) {
-     return res.status(401).send('Invalid credentials.');
-    }
+    const validPassword = await bcrypt.compare(password, user.password); 
+    if (!validPassword) {
+      return res.status(401).send('Invalid credentials.');
+    }
 
-    console.log("BACKEND: Creating token for user:", user.username, "with role:", user.role);
+    console.log("BACKEND: Creating token for user:", user.username, "with role:", user.role);
 
-    const token = jwt.sign(
-      { userId: user.id, username: user.username, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '30d' } // <-- FIX 1: Set to 30 days
-    );
+    const token = jwt.sign(
+      { userId: user.id, username: user.username, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '30d' } // <-- FIX 1: Set to 30 days
+    );
 
     // --- FIX 2: Send both the token AND the user object ---
-    res.json({ 
+    res.json({ 
         token: token,
         user: {
             id: user.id,
@@ -244,10 +244,10 @@ app.post('/api/auth/login', async (req, res) => {
         }
     });
 
-  } catch (err) {
-    console.error("Login Error:", err.message);
-    res.status(500).send('Server error during login.');
-  }
+  } catch (err) {
+    console.error("Login Error:", err.message);
+    res.status(500).send('Server error during login.');
+  }
 });
 
 // --- CUSTOMER ROUTES (Protected) ---
