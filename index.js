@@ -783,64 +783,79 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
 // --- ⭐ CHANGED: Added authorizeAdmin to protect this route ---
 // --- DASHBOARD ROUTES (Protected) ---
 app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, res) => {
-  try {
-    await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
+  try {
+    await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
 
-    // 1. Queries for the React Web App
-    const principalPromise = db.query(
-      "SELECT SUM(principal_amount) FROM Loans WHERE status = 'active' OR status = 'overdue'"
-    );
-    const activeLoansPromise = db.query(
-      "SELECT COUNT(*) FROM Loans WHERE status = 'active' OR status = 'overdue'"
-    );
-    const overdueLoansPromise = db.query(
-      "SELECT COUNT(*) FROM Loans WHERE status = 'overdue'"
-    );
-    const interestThisMonthPromise = db.query(
-      "SELECT SUM(amount_paid) FROM Transactions WHERE payment_type = 'interest' AND payment_date >= date_trunc('month', CURRENT_DATE)"
-    );
+    // 1. Queries for the React Web App
+    const principalPromise = db.query(
+      "SELECT SUM(principal_amount) FROM Loans WHERE status = 'active' OR status = 'overdue'"
+    );
+    const activeLoansPromise = db.query(
+      "SELECT COUNT(*) FROM Loans WHERE status = 'active' OR status = 'overdue'"
+    );
+    const overdueLoansPromise = db.query(
+      "SELECT COUNT(*) FROM Loans WHERE status = 'overdue'"
+    );
+    const interestThisMonthPromise = db.query(
+      "SELECT SUM(amount_paid) FROM Transactions WHERE payment_type = 'interest' AND payment_date >= date_trunc('month', CURRENT_DATE)"
+    );
 
-    // 2. NEW Queries for the Flutter Mobile App
-    const totalCustomersPromise = db.query("SELECT COUNT(*) FROM Customers");
-    const totalLoansPromise = db.query("SELECT COUNT(*) FROM Loans"); // Counts *all* loans
+    // 2. Queries for the Flutter Mobile App
+    const totalCustomersPromise = db.query("SELECT COUNT(*) FROM Customers");
+    const totalLoansPromise = db.query("SELECT COUNT(*) FROM Loans"); // Counts *all* loans
 
-    // 3. Wait for ALL queries to finish
-    const [
-      principalResult,
-      activeLoansResult,
-      overdueLoansResult,
-      interestThisMonthResult,
-      totalCustomersResult, // New result
-      totalLoansResult      // New result
-    ] = await Promise.all([
-      principalPromise,
-      activeLoansPromise,
-      overdueLoansPromise,
-      interestThisMonthPromise,
-      totalCustomersPromise, // New query
-      totalLoansPromise      // New query
-    ]);
+    // --- 3. NEW QUERIES FOR LOAN STATUSES (THAT WERE MISSING) ---
+    const totalPaidPromise = db.query("SELECT COUNT(*) FROM Loans WHERE status = 'paid'");
+    const totalForfeitedPromise = db.query("SELECT COUNT(*) FROM Loans WHERE status = 'forfeited'");
+    // Note: 'activeLoansPromise' and 'overdueLoansPromise' are already being queried
 
-    // 4. Build the combined stats object
-    const stats = {
-      // --- Keys for React Web App ---
-      totalPrincipalOut: parseFloat(principalResult.rows[0].sum) || 0,
-      totalActiveLoans: parseInt(activeLoansResult.rows[0].count) || 0,
-      totalOverdueLoans: parseInt(overdueLoansResult.rows[0].count) || 0,
-      interestCollectedThisMonth: parseFloat(interestThisMonthResult.rows[0].sum) || 0,
+    // 4. Wait for ALL queries to finish
+    const [
+      principalResult,
+      activeLoansResult,
+      overdueLoansResult,
+      interestThisMonthResult,
+      totalCustomersResult, // New result
+      totalLoansResult,     // New result
+      totalPaidResult,      // <-- New result
+      totalForfeitedResult  // <-- New result
+    ] = await Promise.all([
+      principalPromise,
+      activeLoansPromise,
+      overdueLoansPromise,
+      interestThisMonthPromise,
+      totalCustomersPromise,
+      totalLoansPromise,
+      totalPaidPromise,     // <-- New query
+      totalForfeitedPromise // <-- New query
+    ]);
 
-      // --- New Keys for Flutter Mobile App ---
-      totalCustomers: parseInt(totalCustomersResult.rows[0].count) || 0,
-      totalLoans: parseInt(totalLoansResult.rows[0].count) || 0,
-      totalValue: parseFloat(principalResult.rows[0].sum) || 0 // Re-using the same value as 'totalPrincipalOut'
-    };
+    // 5. Build the combined stats object
+    const stats = {
+      // --- Keys for React Web App (Safe) ---
+      totalPrincipalOut: parseFloat(principalResult.rows[0].sum) || 0,
+      totalActiveLoans: parseInt(activeLoansResult.rows[0].count) || 0,
+      totalOverdueLoans: parseInt(overdueLoansResult.rows[0].count) || 0,
+      interestCollectedThisMonth: parseFloat(interestThisMonthResult.rows[0].sum) || 0,
 
-    res.json(stats);
+      // --- Keys for Flutter Mobile App (Safe) ---
+      totalCustomers: parseInt(totalCustomersResult.rows[0].count) || 0,
+      totalLoans: parseInt(totalLoansResult.rows[0].count) || 0,
+      totalValue: parseFloat(principalResult.rows[0].sum) || 0,
+      
+      // --- NEW Keys for the Mobile Dashboard Card (That were missing) ---
+      loansActive: parseInt(activeLoansResult.rows[0].count) || 0,
+      loansOverdue: parseInt(overdueLoansResult.rows[0].count) || 0,
+      loansPaid: parseInt(totalPaidResult.rows[0].count) || 0,
+      loansForfeited: parseInt(totalForfeitedResult.rows[0].count) || 0
+    };
 
-  } catch (err) {
-    console.error("Dashboard Stats Error:", err.message);
-    res.status(500).send("Server Error while fetching dashboard stats.");
-  }
+    res.json(stats);
+
+  } catch (err) {
+    console.error("Dashboard Stats Error:", err.message);
+    res.status(500).send("Server Error while fetching dashboard stats.");
+ }
 });
 
 // --- START THE SERVER ---
