@@ -483,18 +483,127 @@ app.get('/api/customers/:id/loans', authenticateToken, async (req, res) => {
   } catch (err) { console.error("GET Customer Loans Error:", err.message); res.status(500).send("Server Error"); }
 });
 
+// --- Replace the route at line 612 with this new "smart" version ---
 app.post('/api/transactions', authenticateToken, async (req, res) => {
-  try {
-    const { loan_id, amount_paid, payment_type } = req.body;
-    if (!loan_id || !amount_paid || parseFloat(amount_paid) <= 0) { return res.status(400).json({ error: 'Valid Loan ID and positive amount required.' }); }
-    const validPaymentTypes = ['interest', 'principal'];
-    const finalPaymentType = validPaymentTypes.includes(payment_type) ? payment_type : 'payment';
-    const newTransaction = await db.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type) VALUES ($1, $2, $3) RETURNING *", [loan_id, amount_paid, finalPaymentType]);
-    res.status(201).json(newTransaction.rows[0]);
-  } catch (err) {
-    console.error("POST Transaction Error:", err.message);
-    if (err.code === '23503') { return res.status(404).json({ error: 'Loan not found.' }); }
-    res.status(500).send("Server Error");
+  const client = await db.pool.connect();
+  try {
+    const { loan_id, amount_paid, payment_type, details } = req.body;
+    const loanId = parseInt(loan_id);
+    const paymentAmount = parseFloat(amount_paid);
+
+    if (!loanId || !paymentAmount || paymentAmount <= 0) { 
+      return res.status(400).json({ error: 'Valid Loan ID and positive amount required.' }); 
+    }
+
+    await client.query('BEGIN');
+
+    // --- CASE 1: Payment is for Principal (Simple Case) ---
+    // If the user explicitly says they are paying principal, just record it.
+    if (payment_type === 'principal') {
+      const newTransaction = await client.query(
+        "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, details) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", 
+        [loanId, paymentAmount, 'principal', details || 'Principal payment']
+      );
+      await client.query('COMMIT');
+      return res.status(201).json(newTransaction.rows[0]);
+    }
+
+    // --- CASE 2: Payment is for Interest (Complex Case) ---
+    // This is where we do the new calculation and splitting logic.
+    if (payment_type === 'interest') {
+      
+      // 1. Get all data needed for calculation
+      const loanResult = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
+      if (loanResult.rows.length === 0) {
+        throw new Error('Loan not found.');
+      }
+      const loan = loanResult.rows[0];
+      const transactionsResult = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
+      const transactions = transactionsResult.rows;
+
+      // 2. Run the same calculation from the Loan Detail page
+      const principal = parseFloat(loan.principal_amount);
+      const rate = parseFloat(loan.interest_rate);
+      const pledgeDate = new Date(loan.pledge_date);
+      const today = new Date();
+
+      let totalInterestOwed = 0;
+      let interestPaid = 0;
+      let principalPaid = 0;
+
+      const disbursements = [{ amount: principal, date: pledgeDate }];
+      transactions.forEach(tx => {
+        const amount = parseFloat(tx.amount_paid);
+        if (tx.payment_type === 'disbursement') {
+          disbursements.push({ amount: amount, date: new Date(tx.payment_date) });
+        } else if (tx.payment_type === 'principal') {
+          principalPaid += amount;
+        } else if (tx.payment_type === 'interest') {
+          interestPaid += amount;
+        }
+      });
+
+      disbursements.forEach(event => {
+          const monthsFactor = calculateTotalMonthsFactor(event.date, today, event.date === pledgeDate);
+          totalInterestOwed += event.amount * (rate / 100) * monthsFactor;
+      });
+
+      const outstandingInterest = totalInterestOwed - interestPaid;
+
+      // --- 3. The new splitting logic ---
+      if (paymentAmount > outstandingInterest) {
+        // --- This is your scenario! ---
+        // e.g., Paid 5500, but only 4812 is due.
+        
+        const interestPayment = outstandingInterest > 0 ? outstandingInterest : 0; // The 4812
+        const principalPayment = paymentAmount - interestPayment; // The 688
+
+        // Log the interest part
+        if (interestPayment > 0) {
+          await client.query(
+            "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, details) VALUES ($1, $2, 'interest', NOW(), $3) RETURNING *",
+            [loanId, interestPayment, details || 'Interest payment']
+          );
+        }
+        
+        // Log the leftover principal part
+        const principalTx = await client.query(
+          "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, details) VALUES ($1, $2, 'principal', NOW(), $3) RETURNING *",
+          [loanId, principalPayment, details || 'Interest overpayment applied to principal']
+        );
+        
+        await client.query('COMMIT');
+        // Return the *principal* transaction as the primary result,
+        // since two were created.
+        return res.status(201).json(principalTx.rows[0]);
+
+      } else {
+        // --- Simple case: Payment is less than or equal to interest due ---
+        // e.g., Paid 3000, interest due is 4812.
+        const newTransaction = await client.query(
+          "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, details) VALUES ($1, $2, 'interest', NOW(), $3) RETURNING *",
+          [loanId, paymentAmount, details || 'Interest payment']
+        );
+        await client.query('COMMIT');
+        return res.status(201).json(newTransaction.rows[0]);
+      }
+    }
+
+    // Fallback for any other payment_type
+    const newTransaction = await client.query(
+      "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, details) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", 
+      [loanId, paymentAmount, payment_type, details || 'Payment']
+    );
+    await client.query('COMMIT');
+    return res.status(201).json(newTransaction.rows[0]);
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error("POST Transaction Error:", err.message);
+    if (err.code === '23503') { return res.status(404).json({ error: 'Loan not found.' }); }
+    res.status(500).send("Server Error");
+  } finally {
+    client.release();
   }
 });
 
