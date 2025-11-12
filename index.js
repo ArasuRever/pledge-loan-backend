@@ -207,6 +207,7 @@ app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res)
 // --- END USER MANAGEMENT ROUTES ---
 
 // --- This is the corrected login route ---
+// --- Replace the /api/auth/login route (around line 244) with this ---
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -231,10 +232,10 @@ app.post('/api/auth/login', async (req, res) => {
     const token = jwt.sign(
       { userId: user.id, username: user.username, role: user.role },
       JWT_SECRET,
-      { expiresIn: '30d' } // <-- FIX 1: Set to 30 days
+      { expiresIn: '30d' } // <-- FIX #1: Set to 30 days
     );
 
-    // --- FIX 2: Send both the token AND the user object ---
+    // --- FIX #2: Send both the token AND the user object ---
     res.json({ 
         token: token,
         user: {
@@ -636,25 +637,7 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
         return res.status(500).json({ error: "Internal error: Invalid interest rate." });
     }
 
-    const calculateTotalMonthsFactor = (startDate, endDate, isInitialPrincipal) => {
-        if (endDate <= startDate) return 0;
-        let fullMonthsPassed = 0;
-        let tempDate = new Date(startDate);
-        while (true) {
-            const nextMonth = tempDate.getMonth() + 1;
-            tempDate.setMonth(nextMonth);
-            if (tempDate.getMonth() !== (nextMonth % 12)) tempDate.setDate(0); 
-            if (tempDate <= endDate) { fullMonthsPassed++; }
-            else { tempDate.setMonth(tempDate.getMonth() - 1); break; }
-        }
-        const oneDay = 1000 * 60 * 60 * 24;
-        const remainingDays = Math.floor((endDate.getTime() - tempDate.getTime()) / oneDay);
-        let partialFraction = 0; let totalMonthsFactor;
-        if (fullMonthsPassed === 0) { totalMonthsFactor = 1.0; }
-        else { if (remainingDays > 0) { partialFraction = (remainingDays <= 15) ? 0.5 : 1.0; } totalMonthsFactor = fullMonthsPassed + partialFraction; }
-        if (totalMonthsFactor === 0 && (endDate.getTime() > startDate.getTime())) { totalMonthsFactor = 0.5; }
-        return totalMonthsFactor;
-    };
+
 
     const disbursementsResult = await db.query(
       "SELECT amount_paid, payment_date FROM Transactions WHERE loan_id = $1 AND payment_type = 'disbursement' ORDER BY payment_date ASC", 
