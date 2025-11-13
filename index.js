@@ -747,7 +747,7 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
     const principalPromise = db.query("SELECT SUM(principal_amount) FROM Loans WHERE status = 'active' OR status = 'overdue'");
     const activeLoansPromise = db.query("SELECT COUNT(*) FROM Loans WHERE status = 'active' OR status = 'overdue'");
     const overdueLoansPromise = db.query("SELECT COUNT(*) FROM Loans WHERE status = 'overdue'");
-    const interestThisMonthPromise = db.query("SELECT SUM(amount_paid) FROM Transactions WHERE payment_type = 'interest' AND payment_date >= date_trunc('month', CURRENT_DATE)");
+    const interestThisMonthResult = db.query("SELECT SUM(amount_paid) FROM Transactions WHERE payment_type = 'interest' AND payment_date >= date_trunc('month', CURRENT_DATE)");
     const totalCustomersPromise = db.query("SELECT COUNT(*) FROM Customers WHERE status = 'active'"); // Only count active
     const totalLoansPromise = db.query("SELECT COUNT(*) FROM Loans WHERE status != 'deleted'"); // Only count non-deleted
     const totalPaidPromise = db.query("SELECT COUNT(*) FROM Loans WHERE status = 'paid'");
