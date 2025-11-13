@@ -10,7 +10,6 @@ require('dotenv').config();
 const app = express();
 
 // --- ⭐ 1. CONFIGURE CORS FOR PRODUCTION ---
-// List of allowed origins (your frontend URLs)
 const allowedOrigins = [
   'http://localhost:3000', // For local development
   'https://pledge-loan-frontend.onrender.com',
@@ -35,7 +34,6 @@ app.use(cors({
 app.use(express.json());
 
 // --- ⭐ 2. USE RENDER'S PORT ---
-// Render provides its port via the PORT environment variable
 const PORT = process.env.PORT || 3001; 
 // --- END PORT FIX ---
 
@@ -72,6 +70,29 @@ const authorizeAdmin = (req, res, next) => {
   next();
 };
 
+// --- ⭐ FIX #1: GLOBAL INTEREST CALCULATION FUNCTION ---
+// This function is now defined globally so all routes can use it.
+const calculateTotalMonthsFactor = (startDate, endDate, isInitialPrincipal) => {
+  if (endDate <= startDate) return 0;
+  let fullMonthsPassed = 0;
+  let tempDate = new Date(startDate);
+  while (true) {
+      const nextMonth = tempDate.getMonth() + 1;
+      tempDate.setMonth(nextMonth);
+      if (tempDate.getMonth() !== (nextMonth % 12)) tempDate.setDate(0); 
+      if (tempDate <= endDate) { fullMonthsPassed++; }
+      else { tempDate.setMonth(tempDate.getMonth() - 1); break; }
+  }
+  const oneDay = 1000 * 60 * 60 * 24;
+  const remainingDays = Math.floor((endDate.getTime() - tempDate.getTime()) / oneDay);
+  let partialFraction = 0; let totalMonthsFactor;
+  if (fullMonthsPassed === 0) { totalMonthsFactor = 1.0; }
+  else { if (remainingDays > 0) { partialFraction = (remainingDays <= 15) ? 0.5 : 1.0; } totalMonthsFactor = fullMonthsPassed + partialFraction; }
+  if (totalMonthsFactor === 0 && (endDate.getTime() > startDate.getTime())) { totalMonthsFactor = 0.5; }
+  return totalMonthsFactor;
+};
+// --- END GLOBAL FUNCTION ---
+
 // --- UTILITY ROUTE (Public) ---
 app.get('/', async (req, res) => {
   try {
@@ -93,7 +114,6 @@ app.post('/api/auth/register', authenticateToken, authorizeAdmin, async (req, re
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    // --- ⭐ FIX: Changed 'Users' to 'users' ---
     const newUser = await db.query(
       "INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id, username",
       [username, hashedPassword]
@@ -206,53 +226,53 @@ app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res)
 
 // --- END USER MANAGEMENT ROUTES ---
 
-// --- This is the corrected login route ---
-// --- Replace the /api/auth/login route (around line 244) with this ---
+// --- ⭐ 4. UPDATED LOGIN ROUTE ---
 app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    if (!username || !password) {
-      return res.status(400).send('Username and password are required.');
-    }
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).send('Username and password are required.');
+    }
 
-    const userResult = await db.query("SELECT * FROM users WHERE username = $1", [username]);
-    if (userResult.rows.length === 0) {
-      return res.status(401).send('Invalid credentials.');
-    }
-    const user = userResult.rows[0];
+    const userResult = await db.query("SELECT * FROM users WHERE username = $1", [username]);
+    if (userResult.rows.length === 0) {
+      return res.status(401).send('Invalid credentials.');
+    }
+    const user = userResult.rows[0];
 
     // Use the correct 'password' column from your file
-    const validPassword = await bcrypt.compare(password, user.password); 
-    if (!validPassword) {
-      return res.status(401).send('Invalid credentials.');
-    }
+    const validPassword = await bcrypt.compare(password, user.password); 
+    if (!validPassword) {
+      return res.status(401).send('Invalid credentials.');
+    }
 
-    console.log("BACKEND: Creating token for user:", user.username, "with role:", user.role);
+    console.log("BACKEND: Creating token for user:", user.username, "with role:", user.role);
 
-    const token = jwt.sign(
-      { userId: user.id, username: user.username, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '30d' } // <-- FIX #1: Set to 30 days
-    );
+    const token = jwt.sign(
+      { userId: user.id, username: user.username, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '30d' } // Fix 1: Set to 30 days for web/mobile
+    );
 
-    // --- FIX #2: Send both the token AND the user object ---
-    res.json({ 
-        token: token,
-        user: {
-            id: user.id,
-            username: user.username,
-            role: user.role
-        }
+    // Fix 2: Send both token and user object for the mobile app
+    res.json({ 
+      token: token,
+      user: {
+        id: user.id,
+        username: user.username,
+        role: user.role
+      }
     });
 
-  } catch (err) {
-    console.error("Login Error:", err.message);
-    res.status(500).send('Server error during login.');
-  }
+  } catch (err) {
+    console.error("Login Error:", err.message);
+    res.status(500).send('Server error during login.');
+  }
 });
+// --- END UPDATED LOGIN ROUTE ---
+
 
 // --- CUSTOMER ROUTES (Protected) ---
-// (No changes needed below this line, but including the full file)
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
     const allCustomers = await db.query("SELECT id, name, phone_number, address FROM Customers ORDER BY name ASC");
@@ -299,26 +319,26 @@ app.post('/api/customers', authenticateToken, upload.single('photo'), async (req
 
 app.put('/api/customers/:id', authenticateToken, upload.single('photo'), async (req, res) => {
     try {
-        const id = parseInt(req.params.id);
-        if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
-        const { name, phone_number, address } = req.body;
-        let imageBuffer = null;
-        let updateImage = false;
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
+      const { name, phone_number, address } = req.body;
+      let imageBuffer = null;
+      let updateImage = false;
 
-        if (req.file) { imageBuffer = req.file.buffer; updateImage = true; }
-        else if (req.body.removeCurrentImage === 'true') { imageBuffer = null; updateImage = true; }
+      if (req.file) { imageBuffer = req.file.buffer; updateImage = true; }
+      else if (req.body.removeCurrentImage === 'true') { imageBuffer = null; updateImage = true; }
 
-        let query; let values;
-        if (updateImage) {
-            query = "UPDATE Customers SET name = $1, phone_number = $2, address = $3, customer_image_url = $4 WHERE id = $5 RETURNING id, name, phone_number, address";
-            values = [name, phone_number, address, imageBuffer, id];
-        } else {
-            query = "UPDATE Customers SET name = $1, phone_number = $2, address = $3 WHERE id = $4 RETURNING id, name, phone_number, address";
-            values = [name, phone_number, address, id];
-        }
-        const updateCustomerResult = await db.query(query, values);
-        if (updateCustomerResult.rows.length === 0) return res.status(404).json({ error: "Customer not found." });
-        res.json(updateCustomerResult.rows[0]);
+      let query; let values;
+      if (updateImage) {
+         query = "UPDATE Customers SET name = $1, phone_number = $2, address = $3, customer_image_url = $4 WHERE id = $5 RETURNING id, name, phone_number, address";
+         values = [name, phone_number, address, imageBuffer, id];
+      } else {
+         query = "UPDATE Customers SET name = $1, phone_number = $2, address = $3 WHERE id = $4 RETURNING id, name, phone_number, address";
+         values = [name, phone_number, address, id];
+      }
+      const updateCustomerResult = await db.query(query, values);
+      if (updateCustomerResult.rows.length === 0) return res.status(404).json({ error: "Customer not found." });
+      res.json(updateCustomerResult.rows[0]);
     } catch (err) { console.error("PUT Customer Error:", err.message); res.status(500).send("Server Error"); }
 });
 
@@ -328,7 +348,7 @@ app.get('/api/loans', authenticateToken, async (req, res) => {
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
     const query = `
       SELECT l.id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date, l.status,
-             c.name AS customer_name, c.phone_number
+           c.name AS customer_name, c.phone_number
       FROM Loans l JOIN Customers c ON l.customer_id = c.id
       WHERE l.status IN ('active', 'overdue', 'paid', 'forfeited')
       ORDER BY l.pledge_date DESC`; 
@@ -414,21 +434,102 @@ app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => 
   } finally { client.release(); }
 });
 
+// --- ⭐ 5. UPDATED LOAN DETAIL ROUTE (with Calculations) ---
 app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid loan ID." });
+    
+    // 1. Update status
     await db.query("UPDATE Loans SET status = 'overdue' WHERE id = $1 AND due_date < NOW() AND status = 'active'", [id]);
-    const loanQuery = ` SELECT l.*, pi.item_type, pi.description, pi.quality, pi.weight, pi.item_image_data, c.name AS customer_name, c.phone_number, c.customer_image_url FROM Loans l LEFT JOIN PledgedItems pi ON l.id = pi.loan_id JOIN Customers c ON l.customer_id = c.id WHERE l.id = $1`;
+
+    // 2. Get Loan, Item, and Customer Details
+    const loanQuery = `
+      SELECT 
+        l.*, 
+        pi.item_type, pi.description, pi.quality, pi.weight, pi.item_image_data, 
+        c.name AS customer_name, c.phone_number, c.customer_image_url 
+      FROM Loans l 
+      LEFT JOIN PledgedItems pi ON l.id = pi.loan_id 
+      JOIN Customers c ON l.customer_id = c.id 
+      WHERE l.id = $1
+    `;
     const loanResult = await db.query(loanQuery, [id]);
     if (loanResult.rows.length === 0) return res.status(404).json({ error: "Loan not found." });
     let loanDetails = loanResult.rows[0];
+
+    // 3. Get All Transactions
+    // Order ASC so we can calculate principal paid correctly
+    const transactionsResult = await db.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [id]);
+    const transactions = transactionsResult.rows;
+
+    // --- 4. START CALCULATIONS ---
+    const principal = parseFloat(loanDetails.principal_amount);
+    const rate = parseFloat(loanDetails.interest_rate);
+    const pledgeDate = new Date(loanDetails.pledge_date);
+    const today = new Date();
+
+    let totalInterestOwed = 0;
+    let principalPaid = 0;
+    let interestPaid = 0;
+    let totalPaid = 0;
+    let outstandingPrincipal = 0;
+
+    // Separate disbursements and payments
+    const disbursements = [{ amount: principal, date: pledgeDate }];
+    const payments = [];
+
+    transactions.forEach(tx => {
+      const amount = parseFloat(tx.amount_paid);
+      if (tx.payment_type === 'disbursement') {
+      disbursements.push({ amount: amount, date: new Date(tx.payment_date) });
+      } else {
+      payments.push({ amount: amount, date: new Date(tx.payment_date), type: tx.payment_type });
+      totalPaid += amount;
+      if (tx.payment_type === 'principal') {
+        principalPaid += amount;
+      } else if (tx.payment_type === 'interest') {
+        interestPaid += amount;
+      }
+      }
+    });
+    
+    outstandingPrincipal = disbursements.reduce((sum, d) => sum + d.amount, 0) - principalPaid;
+
+    // Calculate interest for each disbursement
+    disbursements.forEach(event => {
+      // Use the global calculation function
+      const monthsFactor = calculateTotalMonthsFactor(event.date, today, event.date === pledgeDate);
+      totalInterestOwed += event.amount * (rate / 100) * monthsFactor;
+    });
+
+    const outstandingInterest = totalInterestOwed - interestPaid;
+    const amountDue = outstandingPrincipal + outstandingInterest;
+    // --- END OF CALCULATIONS ---
+
+    // 5. Handle image data (same as before)
     if (loanDetails.item_image_data) { const ib64 = loanDetails.item_image_data.toString('base64'); let mt = 'image/jpeg'; if (ib64.startsWith('/9j/')) mt = 'image/jpeg'; else if (ib64.startsWith('iVBORw0KGgo')) mt = 'image/png'; loanDetails.item_image_data_url = `data:${mt};base64,${ib64}`; } delete loanDetails.item_image_data;
     if (loanDetails.customer_image_url) { const cb64 = loanDetails.customer_image_url.toString('base64'); let mt = 'image/jpeg'; if (cb64.startsWith('/9j/')) mt = 'image/jpeg'; else if (cb64.startsWith('iVBORw0KGgo')) mt = 'image/png'; loanDetails.customer_image_url = `data:${mt};base64,${cb64}`; }
-    const transactionsResult = await db.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date DESC", [id]);
-    res.json({ loanDetails: loanDetails, transactions: transactionsResult.rows });
+
+    // 6. Send the new 'calculated' object in the response
+    res.json({ 
+      loanDetails: loanDetails, 
+      // Send transactions DESC for the UI
+      transactions: transactions.sort((a, b) => new Date(b.payment_date) - new Date(a.payment_date)),
+      calculated: {
+        totalInterestOwed: totalInterestOwed.toFixed(2),
+        principalPaid: principalPaid.toFixed(2),
+        interestPaid: interestPaid.toFixed(2),
+        totalPaid: totalPaid.toFixed(2),
+        outstandingPrincipal: outstandingPrincipal.toFixed(2),
+        outstandingInterest: outstandingInterest.toFixed(2),
+        amountDue: amountDue.toFixed(2)
+      }
+    });
   } catch (err) { console.error("GET Loan Details Error:", err.message); res.status(500).send("Server Error"); }
 });
+// --- END UPDATED LOAN DETAIL ROUTE ---
+
 
 app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req, res) => {
   const client = await db.pool.connect();
@@ -454,12 +555,12 @@ app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req
       console.log(`Loan ${newLoanId}: Deducting first month's interest.`);
       const firstMonthInterest = principal * (rate / 100);
       if (firstMonthInterest > 0) {
-        const interestTxQuery = `
-          INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date)
-          VALUES ($1, $2, 'interest', NOW())
-        `;
-        await client.query(interestTxQuery, [newLoanId, firstMonthInterest]);
-        console.log(`Loan ${newLoanId}: Logged pre-paid interest of ₹${firstMonthInterest}.`);
+      const interestTxQuery = `
+        INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date)
+        VALUES ($1, $2, 'interest', NOW())
+      `;
+      await client.query(interestTxQuery, [newLoanId, firstMonthInterest]);
+      console.log(`Loan ${newLoanId}: Logged pre-paid interest of ₹${firstMonthInterest}.`);
       }
     }
 
@@ -476,7 +577,7 @@ app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req
 app.get('/api/customers/:id/loans', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-     if (isNaN(id)) return res.status(400).json({ error: "Invalid customer ID." });
+      if (isNaN(id)) return res.status(400).json({ error: "Invalid customer ID." });
     await db.query("UPDATE Loans SET status = 'overdue' WHERE customer_id = $1 AND due_date < NOW() AND status = 'active'", [id]);
     const query = ` SELECT l.id AS loan_id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date, l.status, pi.description FROM Loans l LEFT JOIN PledgedItems pi ON l.id = pi.loan_id WHERE l.customer_id = $1 ORDER BY l.pledge_date DESC`;
     const customerLoans = await db.query(query, [id]);
@@ -484,45 +585,44 @@ app.get('/api/customers/:id/loans', authenticateToken, async (req, res) => {
   } catch (err) { console.error("GET Customer Loans Error:", err.message); res.status(500).send("Server Error"); }
 });
 
-// --- Replace the route at line 612 with this new "smart" version ---
+// --- ⭐ 6. UPDATED "SMART" TRANSACTIONS ROUTE ---
 app.post('/api/transactions', authenticateToken, async (req, res) => {
-  const client = await db.pool.connect();
-  try {
-    const { loan_id, amount_paid, payment_type, details } = req.body;
+  const client = await db.pool.connect();
+  try {
+    const { loan_id, amount_paid, payment_type } = req.body; // 'details' is removed
     const loanId = parseInt(loan_id);
     const paymentAmount = parseFloat(amount_paid);
 
-    if (!loanId || !paymentAmount || paymentAmount <= 0) { 
+    if (!loanId || !paymentAmount || paymentAmount <= 0) { 
       return res.status(400).json({ error: 'Valid Loan ID and positive amount required.' }); 
     }
 
     await client.query('BEGIN');
 
     // --- CASE 1: Payment is for Principal (Simple Case) ---
-    // If the user explicitly says they are paying principal, just record it.
     if (payment_type === 'principal') {
       const newTransaction = await client.query(
-        "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, details) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", 
-        [loanId, paymentAmount, 'principal', details || 'Principal payment']
+      // 'details' column is removed from query
+      "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date) VALUES ($1, $2, $3, NOW()) RETURNING *", 
+      [loanId, paymentAmount, 'principal']
       );
       await client.query('COMMIT');
-      return res.status(201).json(newTransaction.rows[0]);
+      return res.status(201).json([newTransaction.rows[0]]); // Return as array
     }
 
     // --- CASE 2: Payment is for Interest (Complex Case) ---
-    // This is where we do the new calculation and splitting logic.
     if (payment_type === 'interest') {
       
       // 1. Get all data needed for calculation
       const loanResult = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
       if (loanResult.rows.length === 0) {
-        throw new Error('Loan not found.');
+      throw new Error('Loan not found.');
       }
       const loan = loanResult.rows[0];
       const transactionsResult = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
       const transactions = transactionsResult.rows;
 
-      // 2. Run the same calculation from the Loan Detail page
+      // 2. Run the calculation
       const principal = parseFloat(loan.principal_amount);
       const rate = parseFloat(loan.interest_rate);
       const pledgeDate = new Date(loan.pledge_date);
@@ -534,79 +634,79 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
 
       const disbursements = [{ amount: principal, date: pledgeDate }];
       transactions.forEach(tx => {
-        const amount = parseFloat(tx.amount_paid);
-        if (tx.payment_type === 'disbursement') {
-          disbursements.push({ amount: amount, date: new Date(tx.payment_date) });
-        } else if (tx.payment_type === 'principal') {
-          principalPaid += amount;
-        } else if (tx.payment_type === 'interest') {
-          interestPaid += amount;
-        }
+      const amount = parseFloat(tx.amount_paid);
+      if (tx.payment_type === 'disbursement') {
+        disbursements.push({ amount: amount, date: new Date(tx.payment_date) });
+      } else if (tx.payment_type === 'principal') {
+        principalPaid += amount;
+      } else if (tx.payment_type === 'interest') {
+        interestPaid += amount;
+      }
       });
 
       disbursements.forEach(event => {
-          const monthsFactor = calculateTotalMonthsFactor(event.date, today, event.date === pledgeDate);
-          totalInterestOwed += event.amount * (rate / 100) * monthsFactor;
+        // Use the global calculateTotalMonthsFactor function
+        const monthsFactor = calculateTotalMonthsFactor(event.date, today, event.date === pledgeDate);
+        totalInterestOwed += event.amount * (rate / 100) * monthsFactor;
       });
 
       const outstandingInterest = totalInterestOwed - interestPaid;
 
       // --- 3. The new splitting logic ---
       if (paymentAmount > outstandingInterest) {
-        // --- This is your scenario! ---
-        // e.g., Paid 5500, but only 4812 is due.
-        
-        const interestPayment = outstandingInterest > 0 ? outstandingInterest : 0; // The 4812
-        const principalPayment = paymentAmount - interestPayment; // The 688
+      // Payment is MORE than interest due
+      const interestPayment = outstandingInterest > 0 ? outstandingInterest : 0; 
+      const principalPayment = paymentAmount - interestPayment; 
+      let createdTransactions = [];
 
-        // Log the interest part
-        if (interestPayment > 0) {
-          await client.query(
-            "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, details) VALUES ($1, $2, 'interest', NOW(), $3) RETURNING *",
-            [loanId, interestPayment, details || 'Interest payment']
-          );
-        }
-        
-        // Log the leftover principal part
-        const principalTx = await client.query(
-          "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, details) VALUES ($1, $2, 'principal', NOW(), $3) RETURNING *",
-          [loanId, principalPayment, details || 'Interest overpayment applied to principal']
+      // Log the interest part
+      if (interestPayment > 0) {
+        const interestTx = await client.query(
+        "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date) VALUES ($1, $2, 'interest', NOW()) RETURNING *",
+        [loanId, interestPayment]
         );
-        
-        await client.query('COMMIT');
-        // Return the *principal* transaction as the primary result,
-        // since two were created.
-        return res.status(201).json(principalTx.rows[0]);
-
+        createdTransactions.push(interestTx.rows[0]);
+      }
+      
+      // Log the leftover principal part
+      const principalTx = await client.query(
+        "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date) VALUES ($1, $2, 'principal', NOW()) RETURNING *",
+        [loanId, principalPayment]
+      );
+      createdTransactions.push(principalTx.rows[0]);
+      
+      await client.query('COMMIT');
+      return res.status(201).json(createdTransactions); // Return both
       } else {
-        // --- Simple case: Payment is less than or equal to interest due ---
-        // e.g., Paid 3000, interest due is 4812.
-        const newTransaction = await client.query(
-          "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, details) VALUES ($1, $2, 'interest', NOW(), $3) RETURNING *",
-          [loanId, paymentAmount, details || 'Interest payment']
-        );
-        await client.query('COMMIT');
-        return res.status(201).json(newTransaction.rows[0]);
+      // Simple case: Payment is less than or equal to interest due
+      const newTransaction = await client.query(
+        "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date) VALUES ($1, $2, 'interest', NOW()) RETURNING *",
+        [loanId, paymentAmount]
+      );
+      await client.query('COMMIT');
+      return res.status(201).json([newTransaction.rows[0]]); // Return as array
       }
     }
 
     // Fallback for any other payment_type
     const newTransaction = await client.query(
-      "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, details) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", 
-      [loanId, paymentAmount, payment_type, details || 'Payment']
+      "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date) VALUES ($1, $2, $3, NOW()) RETURNING *", 
+      [loanId, paymentAmount, payment_type]
     );
     await client.query('COMMIT');
-    return res.status(201).json(newTransaction.rows[0]);
+    return res.status(201).json([newTransaction.rows[0]]); // Return as array
 
-  } catch (err) {
+  } catch (err) {
     await client.query('ROLLBACK');
-    console.error("POST Transaction Error:", err.message);
-    if (err.code === '23503') { return res.status(404).json({ error: 'Loan not found.' }); }
-    res.status(500).send("Server Error");
-  } finally {
+    console.error("POST Transaction Error:", err.message);
+    if (err.code === '23503') { return res.status(404).json({ error: 'Loan not found.' }); }
+    res.status(500).send("Server Error");
+  } finally {
     client.release();
   }
 });
+// --- END UPDATED TRANSACTIONS ROUTE ---
+
 
 app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
   try {
@@ -624,7 +724,7 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
     const loan = loanResult.rows[0];
 
     if (loan.status !== 'active' && loan.status !== 'overdue') {
-        return res.status(400).json({ error: `Cannot settle a loan with status '${loan.status}'.` });
+      return res.status(400).json({ error: `Cannot settle a loan with status '${loan.status}'.` });
     }
 
     const currentPrincipalTotal = parseFloat(loan.principal_amount);
@@ -633,12 +733,11 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
     const today = new Date();
 
     if (isNaN(monthlyInterestRatePercent) || monthlyInterestRatePercent <= 0) {
-        console.error(`Loan ID ${loanId}: Invalid stored interest rate.`);
-        return res.status(500).json({ error: "Internal error: Invalid interest rate." });
+      console.error(`Loan ID ${loanId}: Invalid stored interest rate.`);
+      return res.status(500).json({ error: "Internal error: Invalid interest rate." });
     }
 
-
-
+    // --- ⭐ FIX: Using the global function ---
     const disbursementsResult = await db.query(
       "SELECT amount_paid, payment_date FROM Transactions WHERE loan_id = $1 AND payment_type = 'disbursement' ORDER BY payment_date ASC", 
       [loanId]
@@ -649,24 +748,24 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
 
     let disbursementEvents = [];
     if (initialPrincipal > 0) {
-        disbursementEvents.push({ amount: initialPrincipal, date: pledgeDate, isInitial: true });
+      disbursementEvents.push({ amount: initialPrincipal, date: pledgeDate, isInitial: true });
     }
     disbursementEvents = disbursementEvents.concat(
-        disbursementsResult.rows.map(row => ({
-            amount: parseFloat(row.amount_paid),
-            date: new Date(row.payment_date),
-            isInitial: false
-        }))
+      disbursementsResult.rows.map(row => ({
+      amount: parseFloat(row.amount_paid),
+      date: new Date(row.payment_date),
+      isInitial: false
+      }))
     );
     
     let totalInterest = 0;
     let maxMonthsFactor = 0; 
     for (const event of disbursementEvents) {
-        if (event.amount <= 0) continue;
-        const monthsFactor = calculateTotalMonthsFactor(event.date, today, event.isInitial);
-        const monthlyInterestRateDecimal = monthlyInterestRatePercent / 100;
-        totalInterest += event.amount * monthlyInterestRateDecimal * monthsFactor;
-        if (event.isInitial) maxMonthsFactor = monthsFactor; 
+      if (event.amount <= 0) continue;
+      const monthsFactor = calculateTotalMonthsFactor(event.date, today, event.isInitial);
+      const monthlyInterestRateDecimal = monthlyInterestRatePercent / 100;
+      totalInterest += event.amount * monthlyInterestRateDecimal * monthsFactor;
+      if (event.isInitial) maxMonthsFactor = monthsFactor; 
     }
     
     const totalMonthsFactorReport = maxMonthsFactor > 0 ? maxMonthsFactor : calculateTotalMonthsFactor(pledgeDate, today, true);
@@ -675,10 +774,10 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
     const totalPaid = parseFloat(transactionsResult.rows[0].total_paid) || 0;
     const finalBalance = totalOwed - totalPaid - discount;
 
-    if (finalBalance > 1) {
-        return res.status(400).json({
-            error: `Cannot close loan. Owed: ₹${totalOwed.toFixed(2)} (Interest: ₹${totalInterest.toFixed(2)} based on ${totalMonthsFactorReport} months @ ${monthlyInterestRatePercent}% p.m.), Paid: ₹${totalPaid.toFixed(2)}, Discount: ₹${discount.toFixed(2)}. Outstanding balance: ₹${finalBalance.toFixed(2)}.`
-        });
+    if (finalBalance > 1) { // Allow a small margin for floating point errors
+      return res.status(400).json({
+        error: `Cannot close loan. Owed: ₹${totalOwed.toFixed(2)} (Interest: ₹${totalInterest.toFixed(2)} based on ${totalMonthsFactorReport} months @ ${monthlyInterestRatePercent}% p.m.), Paid: ₹${totalPaid.toFixed(2)}, Discount: ₹${discount.toFixed(2)}. Outstanding balance: ₹${finalBalance.toFixed(2)}.`
+      });
     }
 
     const closeLoan = await db.query("UPDATE Loans SET status = 'paid' WHERE id = $1 RETURNING *", [loanId]);
@@ -696,8 +795,8 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
     const username = req.user.username; 
 
     const {
-        book_loan_number, interest_rate, pledge_date, due_date,
-        item_type, description, quality, weight
+      book_loan_number, interest_rate, pledge_date, due_date,
+      item_type, description, quality, weight
     } = req.body;
     const newItemImageBuffer = req.file ? req.file.buffer : undefined;
     const removeItemImage = req.body.removeItemImage === 'true';
@@ -711,19 +810,19 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
         await client.query('BEGIN');
 
         const currentDataQuery = `
-            SELECT
-                l.book_loan_number, l.interest_rate, l.pledge_date, l.due_date,
-                pi.id AS item_id, pi.item_type, pi.description, pi.quality, pi.weight, pi.item_image_data
-            FROM "loans" l
-            LEFT JOIN "pledgeditems" pi ON l.id = pi.loan_id
-            WHERE l.id = $1
-            FOR UPDATE OF l;
+          SELECT
+            l.book_loan_number, l.interest_rate, l.pledge_date, l.due_date,
+            pi.id AS item_id, pi.item_type, pi.description, pi.quality, pi.weight, pi.item_image_data
+          FROM "loans" l
+          LEFT JOIN "pledgeditems" pi ON l.id = pi.loan_id
+          WHERE l.id = $1
+          FOR UPDATE OF l;
         `;
         const currentResult = await client.query(currentDataQuery, [loanId]);
 
         if (currentResult.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: "Loan not found." });
+          await client.query('ROLLBACK');
+          return res.status(404).json({ error: "Loan not found." });
         }
         const oldData = currentResult.rows[0];
         const itemId = oldData.item_id;
@@ -735,52 +834,52 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
         const itemUpdateValues = [];
 
         const addUpdate = (table, field, newValue, oldValue, fieldsArray, valuesArray, logLabel = field) => {
-            if (newValue === undefined) {
-                return;
-            }
-            let oldValCompare, newValCompare;
-            const dateFields = ['pledge_date', 'due_date'];
-            if (dateFields.includes(field)) {
-                if (newValue === "" || newValue === null) {
-                    newValCompare = null;
-                } else {
-                    newValCompare = newValue; 
-                }
-                if (oldValue === null || oldValue === undefined) {
-                    oldValCompare = null;
-                } else {
-                    const d = new Date(oldValue);
-                    const year = d.getFullYear();
-                    const month = String(d.getMonth() + 1).padStart(2, '0');
-                    const day = String(d.getDate()).padStart(2, '0');
-                    oldValCompare = `${year}-${month}-${day}`;
-                }
+          if (newValue === undefined) {
+            return;
+          }
+          let oldValCompare, newValCompare;
+          const dateFields = ['pledge_date', 'due_date'];
+          if (dateFields.includes(field)) {
+            if (newValue === "" || newValue === null) {
+              newValCompare = null;
             } else {
-                oldValCompare = oldValue;
-                newValCompare = newValue;
-                if (typeof oldValue === 'number' || !isNaN(parseFloat(oldValue))) {
-                    oldValCompare = parseFloat(oldValue);
-                    newValCompare = parseFloat(newValue);
-                    if (oldValue === null) oldValCompare = null;
-                    if (newValue === null) newValCompare = null;
-                }
+              newValCompare = newValue; 
             }
-            
-            if (newValCompare !== oldValCompare) {
-                let dbValue = newValue;
-                if (dateFields.includes(field) && (newValue === "" || newValue === null)) {
-                    dbValue = null; 
-                }
-                fieldsArray.push(`"${field}"`); 
-                valuesArray.push(dbValue);
-                historyLogs.push({
-                    loan_id: loanId,
-                    field_changed: logLabel,
-                    old_value: String(oldValue ?? 'null'), 
-                    new_value: String(dbValue ?? 'null'), 
-                    changed_by_username: username
-                });
+            if (oldValue === null || oldValue === undefined) {
+              oldValCompare = null;
+            } else {
+              const d = new Date(oldValue);
+              const year = d.getFullYear();
+              const month = String(d.getMonth() + 1).padStart(2, '0');
+              const day = String(d.getDate()).padStart(2, '0');
+              oldValCompare = `${year}-${month}-${day}`;
             }
+          } else {
+            oldValCompare = oldValue;
+            newValCompare = newValue;
+            if (typeof oldValue === 'number' || !isNaN(parseFloat(oldValue))) {
+              oldValCompare = parseFloat(oldValue);
+              newValCompare = parseFloat(newValue);
+              if (oldValue === null) oldValCompare = null;
+              if (newValue === null) newValCompare = null;
+            }
+          }
+          
+          if (newValCompare !== oldValCompare) {
+            let dbValue = newValue;
+            if (dateFields.includes(field) && (newValue === "" || newValue === null)) {
+              dbValue = null; 
+            }
+            fieldsArray.push(`"${field}"`); 
+            valuesArray.push(dbValue);
+            historyLogs.push({
+              loan_id: loanId,
+              field_changed: logLabel,
+              old_value: String(oldValue ?? 'null'), 
+              new_value: String(dbValue ?? 'null'), 
+              changed_by_username: username
+            });
+          }
         };
 
         addUpdate('loans', 'book_loan_number', book_loan_number, oldData.book_loan_number, loanUpdateFields, loanUpdateValues);
@@ -789,48 +888,48 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
         addUpdate('loans', 'due_date', due_date, oldData.due_date, loanUpdateFields, loanUpdateValues);
 
         if (itemId) {
-            addUpdate('pledgeditems', 'item_type', item_type, oldData.item_type, itemUpdateFields, itemUpdateValues);
-            addUpdate('pledgeditems', 'description', description, oldData.description, itemUpdateFields, itemUpdateValues);
-            addUpdate('pledgeditems', 'quality', quality, oldData.quality, itemUpdateFields, itemUpdateValues);
-            addUpdate('pledgeditems', 'weight', weight, oldData.weight, itemUpdateFields, itemUpdateValues);
+          addUpdate('pledgeditems', 'item_type', item_type, oldData.item_type, itemUpdateFields, itemUpdateValues);
+          addUpdate('pledgeditems', 'description', description, oldData.description, itemUpdateFields, itemUpdateValues);
+          addUpdate('pledgeditems', 'quality', quality, oldData.quality, itemUpdateFields, itemUpdateValues);
+          addUpdate('pledgeditems', 'weight', weight, oldData.weight, itemUpdateFields, itemUpdateValues);
 
-            if (newItemImageBuffer !== undefined || removeItemImage) {
-                const finalImageValue = removeItemImage ? null : newItemImageBuffer;
-                itemUpdateFields.push(`"item_image_data"`);
-                itemUpdateValues.push(finalImageValue);
-                historyLogs.push({
-                    loan_id: loanId, field_changed: 'item_image', old_value: oldData.item_image_data ? '[Image Data]' : '[No Image]', new_value: finalImageValue ? '[New Image Data]' : '[Image Removed]', changed_by_username: username
-                });
-            }
+          if (newItemImageBuffer !== undefined || removeItemImage) {
+            const finalImageValue = removeItemImage ? null : newItemImageBuffer;
+            itemUpdateFields.push(`"item_image_data"`);
+            itemUpdateValues.push(finalImageValue);
+            historyLogs.push({
+              loan_id: loanId, field_changed: 'item_image', old_value: oldData.item_image_data ? '[Image Data]' : '[No Image]', new_value: finalImageValue ? '[New Image Data]' : '[Image Removed]', changed_by_username: username
+            });
+          }
         }
 
         if (loanUpdateFields.length > 0) {
-            const loanSetClause = loanUpdateFields.map((field, i) => `${field} = $${i + 1}`).join(', ');
-            loanUpdateValues.push(loanId); 
-            const loanUpdateQuery = `UPDATE "loans" SET ${loanSetClause} WHERE id = $${loanUpdateValues.length}`;
-            console.log("Executing Loan Update:", loanUpdateQuery);
-            console.log("With values:", loanUpdateValues);
-            await client.query(loanUpdateQuery, loanUpdateValues);
+          const loanSetClause = loanUpdateFields.map((field, i) => `${field} = $${i + 1}`).join(', ');
+          loanUpdateValues.push(loanId); 
+          const loanUpdateQuery = `UPDATE "loans" SET ${loanSetClause} WHERE id = $${loanUpdateValues.length}`;
+          console.log("Executing Loan Update:", loanUpdateQuery);
+          console.log("With values:", loanUpdateValues);
+          await client.query(loanUpdateQuery, loanUpdateValues);
         }
 
         if (itemUpdateFields.length > 0 && itemId) {
-            const itemSetClause = itemUpdateFields.map((field, i) => `${field} = $${i + 1}`).join(', ');
-            itemUpdateValues.push(itemId); 
-            const itemUpdateQuery = `UPDATE "pledgeditems" SET ${itemSetClause} WHERE id = $${itemUpdateValues.length}`;
-            console.log("Executing Item Update:", itemUpdateQuery);
-            console.log("With values:", itemUpdateValues);
-            await client.query(itemUpdateQuery, itemUpdateValues);
+          const itemSetClause = itemUpdateFields.map((field, i) => `${field} = $${i + 1}`).join(', ');
+          itemUpdateValues.push(itemId); 
+          const itemUpdateQuery = `UPDATE "pledgeditems" SET ${itemSetClause} WHERE id = $${itemUpdateValues.length}`;
+          console.log("Executing Item Update:", itemUpdateQuery);
+          console.log("With values:", itemUpdateValues);
+          await client.query(itemUpdateQuery, itemUpdateValues);
         }
 
         if (historyLogs.length > 0) {
-            const historyInsertQuery = `
-                INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username)
-                VALUES ($1, $2, $3, $4, $5)
-            `;
-            for (const log of historyLogs) {
-                await client.query(historyInsertQuery, [log.loan_id, log.field_changed, log.old_value, log.new_value, log.changed_by_username]);
-            }
-            console.log(`Logged ${historyLogs.length} changes for loan ${loanId}`);
+          const historyInsertQuery = `
+            INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username)
+            VALUES ($1, $2, $3, $4, $5)
+          `;
+          for (const log of historyLogs) {
+            await client.query(historyInsertQuery, [log.loan_id, log.field_changed, log.old_value, log.new_value, log.changed_by_username]);
+          }
+          console.log(`Logged ${historyLogs.length} changes for loan ${loanId}`);
         }
 
         await client.query('COMMIT');
@@ -840,7 +939,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
         await client.query('ROLLBACK');
         console.error(`Error updating loan ${loanId}:`, err.message);
         if (err.code === '23505' && err.constraint === 'loans_book_loan_number_key') {
-             return res.status(400).json({ error: "Book Loan Number already exists." });
+           return res.status(400).json({ error: "Book Loan Number already exists." });
         }
         res.status(500).send("Server Error while updating loan.");
     } finally {
@@ -858,10 +957,10 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
 
     try {
         const historyQuery = `
-            SELECT field_changed, old_value, new_value, changed_at, changed_by_username
-            FROM loan_history
-            WHERE loan_id = $1
-            ORDER BY changed_at DESC;
+          SELECT field_changed, old_value, new_value, changed_at, changed_by_username
+           FROM loan_history
+           WHERE loan_id = $1
+           ORDER BY changed_at DESC;
         `;
         const historyResult = await db.query(historyQuery, [loanId]);
         res.json(historyResult.rows);
@@ -872,83 +971,82 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
 });
 
 // --- DASHBOARD ROUTES (Protected) ---
-// --- ⭐ CHANGED: Added authorizeAdmin to protect this route ---
-// --- DASHBOARD ROUTES (Protected) ---
+// --- ⭐ 7. UPDATED DASHBOARD STATS ---
 app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, res) => {
-  try {
-    await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
+  try {
+    await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
 
-    // 1. Queries for the React Web App
-    const principalPromise = db.query(
-      "SELECT SUM(principal_amount) FROM Loans WHERE status = 'active' OR status = 'overdue'"
-    );
-    const activeLoansPromise = db.query(
-      "SELECT COUNT(*) FROM Loans WHERE status = 'active' OR status = 'overdue'"
-    );
-    const overdueLoansPromise = db.query(
-      "SELECT COUNT(*) FROM Loans WHERE status = 'overdue'"
-    );
-    const interestThisMonthPromise = db.query(
-      "SELECT SUM(amount_paid) FROM Transactions WHERE payment_type = 'interest' AND payment_date >= date_trunc('month', CURRENT_DATE)"
-    );
+    // 1. Queries for the React Web App
+    const principalPromise = db.query(
+      "SELECT SUM(principal_amount) FROM Loans WHERE status = 'active' OR status = 'overdue'"
+    );
+    const activeLoansPromise = db.query(
+      "SELECT COUNT(*) FROM Loans WHERE status = 'active' OR status = 'overdue'"
+    );
+    const overdueLoansPromise = db.query(
+      "SELECT COUNT(*) FROM Loans WHERE status = 'overdue'"
+    );
+    const interestThisMonthPromise = db.query( // Renamed for clarity
+      "SELECT SUM(amount_paid) FROM Transactions WHERE payment_type = 'interest' AND payment_date >= date_trunc('month', CURRENT_DATE)"
+    );
 
-    // 2. Queries for the Flutter Mobile App
-    const totalCustomersPromise = db.query("SELECT COUNT(*) FROM Customers");
-    const totalLoansPromise = db.query("SELECT COUNT(*) FROM Loans"); // Counts *all* loans
+    // 2. Queries for the Flutter Mobile App
+    const totalCustomersPromise = db.query("SELECT COUNT(*) FROM Customers");
+    const totalLoansPromise = db.query("SELECT COUNT(*) FROM Loans"); // Counts *all* loans
 
-    // --- 3. NEW QUERIES FOR LOAN STATUSES (THAT WERE MISSING) ---
+    // --- 3. NEW QUERIES FOR LOAN STATUSES ---
     const totalPaidPromise = db.query("SELECT COUNT(*) FROM Loans WHERE status = 'paid'");
     const totalForfeitedPromise = db.query("SELECT COUNT(*) FROM Loans WHERE status = 'forfeited'");
-    // Note: 'activeLoansPromise' and 'overdueLoansPromise' are already being queried
 
-    // 4. Wait for ALL queries to finish
-    const [
-      principalResult,
-      activeLoansResult,
-      overdueLoansResult,
-      interestThisMonthResult,
-      totalCustomersResult, // New result
-      totalLoansResult,     // New result
-      totalPaidResult,      // <-- New result
-      totalForfeitedResult  // <-- New result
-    ] = await Promise.all([
-      principalPromise,
-      activeLoansPromise,
-      overdueLoansPromise,
-      interestThisMonthPromise,
-      totalCustomersPromise,
-      totalLoansPromise,
-      totalPaidPromise,     // <-- New query
-      totalForfeitedPromise // <-- New query
-    ]);
+    // 4. Wait for ALL queries to finish
+    const [
+      principalResult,
+      activeLoansResult,
+      overdueLoansResult,
+      interestThisMonthResult, // Corrected variable name
+      totalCustomersResult, 
+      totalLoansResult,
+      totalPaidResult,       
+      totalForfeitedResult   
+    ] = await Promise.all([
+      principalPromise,
+      activeLoansPromise,
+      overdueLoansPromise,
+      interestThisMonthPromise,
+      totalCustomersPromise,
+      totalLoansPromise,
+      totalPaidPromise,     
+      totalForfeitedPromise 
+    ]);
 
-    // 5. Build the combined stats object
-    const stats = {
-      // --- Keys for React Web App (Safe) ---
-      totalPrincipalOut: parseFloat(principalResult.rows[0].sum) || 0,
-      totalActiveLoans: parseInt(activeLoansResult.rows[0].count) || 0,
-      totalOverdueLoans: parseInt(overdueLoansResult.rows[0].count) || 0,
-      interestCollectedThisMonth: parseFloat(interestThisMonthResult.rows[0].sum) || 0,
+    // 5. Build the combined stats object
+    const stats = {
+      // --- Keys for React Web App (Safe) ---
+      totalPrincipalOut: parseFloat(principalResult.rows[0].sum) || 0,
+      totalActiveLoans: parseInt(activeLoansResult.rows[0].count) || 0,
+      totalOverdueLoans: parseInt(overdueLoansResult.rows[0].count) || 0,
+      interestCollectedThisMonth: parseFloat(interestThisMonthResult.rows[0].sum) || 0, // Corrected variable
 
-      // --- Keys for Flutter Mobile App (Safe) ---
-      totalCustomers: parseInt(totalCustomersResult.rows[0].count) || 0,
-      totalLoans: parseInt(totalLoansResult.rows[0].count) || 0,
-      totalValue: parseFloat(principalResult.rows[0].sum) || 0,
+      // --- Keys for Flutter Mobile App (Safe) ---
+      totalCustomers: parseInt(totalCustomersResult.rows[0].count) || 0,
+      totalLoans: parseInt(totalLoansResult.rows[0].count) || 0,
+      totalValue: parseFloat(principalResult.rows[0].sum) || 0,
       
-      // --- NEW Keys for the Mobile Dashboard Card (That were missing) ---
+      // --- NEW Keys for the Mobile Dashboard Card ---
       loansActive: parseInt(activeLoansResult.rows[0].count) || 0,
       loansOverdue: parseInt(overdueLoansResult.rows[0].count) || 0,
       loansPaid: parseInt(totalPaidResult.rows[0].count) || 0,
       loansForfeited: parseInt(totalForfeitedResult.rows[0].count) || 0
-    };
+    };
 
-    res.json(stats);
+    res.json(stats);
 
-  } catch (err) {
-    console.error("Dashboard Stats Error:", err.message);
-    res.status(500).send("Server Error while fetching dashboard stats.");
- }
+  } catch (err) {
+    console.error("Dashboard Stats Error:", err.message);
+    res.status(500).send("Server Error while fetching dashboard stats.");
+  }
 });
+// --- END UPDATED DASHBOARD STATS ---
 
 // --- START THE SERVER ---
 app.listen(PORT, () => {
