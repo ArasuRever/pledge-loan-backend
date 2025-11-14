@@ -359,19 +359,23 @@ app.get('/api/loans/recent/closed', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/loans/overdue', authenticateToken, async (req, res) => {
-  try {
-  	await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
-  	const query = `
-  	  SELECT l.id, l.due_date, c.name AS customer_name, l.principal_amount, l.book_loan_number, l.pledge_date
-  	  FROM Loans l JOIN Customers c ON l.customer_id = c.id
-  	  WHERE l.status = 'overdue'
-  	  ORDER BY l.due_date ASC`;
-  	const overdueLoans = await db.query(query);
-  	res.json(overdueLoans.rows);
-  } catch (err) {
-  	console.error("OVERDUE LOANS API ERROR:", err.message);
-  	res.status(500).send("Server Error");
-  }
+  try {
+    // This updates the status of loans if their due date is passed
+    await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'"); 
+    
+    // Cleaned Query: Note the intentional indentation inside the backticks
+    const query = `
+      SELECT l.id, l.due_date, c.name AS customer_name, l.principal_amount, l.book_loan_number, l.pledge_date
+      FROM Loans l JOIN Customers c ON l.customer_id = c.id
+      WHERE l.status = 'overdue'
+      ORDER BY l.due_date ASC
+    `;
+    const overdueLoans = await db.query(query);
+    res.json(overdueLoans.rows);
+  } catch (err) {
+    console.error("OVERDUE LOANS API ERROR:", err.message);
+    res.status(500).send("Server Error");
+  }
 });
 
 app.get('/api/loans/find-by-book-number/:bookNumber', authenticateToken, async (req, res) => {
