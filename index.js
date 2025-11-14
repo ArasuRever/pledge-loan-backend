@@ -200,7 +200,7 @@ app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res)
   } catch (err) {
   	console.error("Delete Staff Error:", err.message);
   	res.status(500).send('Server error deleting user.');
-  }
+D }
 });
 
 // --- ⭐ 4. UPDATED LOGIN ROUTE (Fixes Mobile App & Web App Logout) ---
@@ -457,6 +457,7 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   	transactions.forEach(tx => {
   	  const amount = parseFloat(tx.amount_paid);
   	  if (tx.payment_type === 'disbursement') {
+        // Collect disbursement transactions
   	 	disbursementTxs.push({ amount: amount, date: new Date(tx.payment_date) });
   	  } else {
   	 	payments.push({ amount: amount, date: new Date(tx.payment_date), type: tx.payment_type });
@@ -574,7 +575,7 @@ app.get('/api/customers/:id/loans', authenticateToken, async (req, res) => {
   } catch (err) { console.error("GET Customer Loans Error:", err.message); res.status(500).send("Server Error"); }
 });
 
-// --- ⭐ 6. UPDATED "SMART" TRANSACTIONS ROUTE (Fixes 'details' bug) ---
+// --- ⭐ 6. UPDATED "SMART" TRANSACTIONS ROUTE (Fixes 'details' & 'calculate' bug) ---
 app.post('/api/transactions', authenticateToken, async (req, res) => {
   const client = await db.pool.connect();
   try {
@@ -621,11 +622,12 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
   	  let interestPaid = 0;
   	  let principalPaid = 0;
 
-  	  const disbursements = [{ amount: principal, date: pledgeDate }];
+  	  // This logic is now fixed to handle multiple disbursements correctly
+     const disbursementTxs = [];
   	  transactions.forEach(tx => {
   	 	const amount = parseFloat(tx.amount_paid);
   	 	if (tx.payment_type === 'disbursement') {
-  	 	  disbursements.push({ amount: amount, date: new Date(tx.payment_date) });
+  	 	  disbursementTxs.push({ amount: amount, date: new Date(tx.payment_date) });
   	 	} else if (tx.payment_type === 'principal') {
   	 	  principalPaid += amount;
   	 	} else if (tx.payment_type === 'interest') {
@@ -633,9 +635,18 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
   	 	}
   	  });
 
+     const subsequentDisbursementsSum = disbursementTxs.reduce((sum, tx) => sum + tx.amount, 0);
+     const initialPrincipal = principal - subsequentDisbursementsSum;
+     
+     const disbursements = [];
+     if (initialPrincipal > 0) {
+         disbursements.push({ amount: initialPrincipal, date: pledgeDate, isInitial: true });
+     }
+     disbursements.push(...disbursementTxs.map(tx => ({ ...tx, isInitial: false })));
+
   	  disbursements.forEach(event => {
   		  // Use the global calculateTotalMonthsFactor function
-  		  const monthsFactor = calculateTotalMonthsFactor(event.date, today, event.date === pledgeDate);
+  		  const monthsFactor = calculateTotalMonthsFactor(event.date, today, event.isInitial);
   		  totalInterestOwed += event.amount * (rate / 100) * monthsFactor;
   	  });
 
@@ -738,7 +749,7 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
   	let disbursementEvents = [];
   	if (initialPrincipal > 0) {
   	  disbursementEvents.push({ amount: initialPrincipal, date: pledgeDate, isInitial: true });
-  	}
+   	}
   	disbursementEvents = disbursementEvents.concat(
   	  disbursementsResult.rows.map(row => ({
   	 	amount: parseFloat(row.amount_paid),
@@ -752,10 +763,10 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
   	for (const event of disbursementEvents) {
   	  if (event.amount <= 0) continue;
   	  const monthsFactor = calculateTotalMonthsFactor(event.date, today, event.isInitial);
-      const monthlyInterestRateDecimal = monthlyInterestRatePercent / 100;
+  	  const monthlyInterestRateDecimal = monthlyInterestRatePercent / 100;
   	  totalInterest += event.amount * monthlyInterestRateDecimal * monthsFactor;
   	  if (event.isInitial) maxMonthsFactor = monthsFactor; 
-  	}
+   }
   	
   	const totalMonthsFactorReport = maxMonthsFactor > 0 ? maxMonthsFactor : calculateTotalMonthsFactor(pledgeDate, today, true);
   	const totalOwed = currentPrincipalTotal + totalInterest;
@@ -792,7 +803,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
 
   	if (isNaN(loanId) || loanId <= 0) {
   		  return res.status(400).json({ error: "Invalid loan ID." });
-   }
+  	}
 
   	const client = await db.pool.connect();
   	try {
@@ -834,7 +845,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
   				  } else {
   					  newValCompare = newValue; 
   				  }
-   				  if (oldValue === null || oldValue === undefined) {
+  				  if (oldValue === null || oldValue === undefined) {
   					  oldValCompare = null;
   				  } else {
   					  const d = new Date(oldValue);
@@ -845,7 +856,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
   				  }
   			  } else {
   				  oldValCompare = oldValue;
-  				  newValCompare = newValue;
+   				  newValCompare = newValue;
   				  if (typeof oldValue === 'number' || !isNaN(parseFloat(oldValue))) {
   					  oldValCompare = parseFloat(oldValue);
   					  newValCompare = parseFloat(newValue);
@@ -888,7 +899,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
   				  itemUpdateValues.push(finalImageValue);
   				  historyLogs.push({
   					  loan_id: loanId, field_changed: 'item_image', old_value: oldData.item_image_data ? '[Image Data]' : '[No Image]', new_value: finalImageValue ? '[New Image Data]' : '[Image Removed]', changed_by_username: username
-  				  });
+   				  });
   			  }
   		  }
 
@@ -899,7 +910,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
   			  console.log("Executing Loan Update:", loanUpdateQuery);
   			  console.log("With values:", loanUpdateValues);
   			  await client.query(loanUpdateQuery, loanUpdateValues);
-   		  }
+  		  }
 
   		  if (itemUpdateFields.length > 0 && itemId) {
   			  const itemSetClause = itemUpdateFields.map((field, i) => `${field} = $${i + 1}`).join(', ');
@@ -907,7 +918,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
   			  const itemUpdateQuery = `UPDATE "pledgeditems" SET ${itemSetClause} WHERE id = $${itemUpdateValues.length}`;
   			  console.log("Executing Item Update:", itemUpdateQuery);
   			  console.log("With values:", itemUpdateValues);
-  			  await client.query(itemUpdateQuery, itemUpdateValues);
+   			  await client.query(itemUpdateQuery, itemUpdateValues);
   		  }
 
   		  if (historyLogs.length > 0) {
@@ -932,7 +943,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
   		  }
   		  res.status(500).send("Server Error while updating loan.");
   	} finally {
-  		  client.release();
+   		  client.release();
   	}
 });
 
@@ -947,19 +958,19 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
   	try {
   		  const historyQuery = `
   			  SELECT field_changed, old_value, new_value, changed_at, changed_by_username
-ANA 			  FROM loan_history
+  			  FROM loan_history
   			  WHERE loan_id = $1
   			  ORDER BY changed_at DESC;
   		  `;
   		  const historyResult = await db.query(historyQuery, [loanId]);
-  		  res.json(historyResult.rows);
+   		  res.json(historyResult.rows);
   	} catch (err) {
   		  console.error(`Error fetching history for loan ${loanId}:`, err.message);
   		  res.status(500).send("Server Error fetching loan history.");
   	}
 });
 
-// --- ⭐ 7. UPDATED DASHBOARD STATS (for Mobile App) ---
+// --- ⭐ 7. UPDATED DASHBOARD STATS (Fixes duplicate 'interestThisMonthPromise') ---
 app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
   	await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
@@ -991,7 +1002,7 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
   	  principalResult,
   	  activeLoansResult,
   	  overdueLoansResult,
-  	  interestThisMonthResult, // <-- THIS IS THE FIX
+  	  interestThisMonthResult, // <-- THIS IS THE FIX (was 'interestThisMonthPromise')
   	  totalCustomersResult, 
   	  totalLoansResult,
   	  totalPaidResult,      
@@ -1002,7 +1013,7 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
   	  overdueLoansPromise,
   	  interestThisMonthPromise, // This promise name is correct
   	  totalCustomersPromise,
-  	  totalLoansPromise,
+   	  totalLoansPromise,
   	  totalPaidPromise,   	
   	  totalForfeitedPromise 
   	]);
@@ -1017,7 +1028,7 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
 
   	  // --- Keys for Flutter Mobile App (Safe) ---
   	  totalCustomers: parseInt(totalCustomersResult.rows[0].count) || 0,
-  	  totalLoans: parseInt(totalLoansResult.rows[0].count) || 0,
+   	  totalLoans: parseInt(totalLoansResult.rows[0].count) || 0,
   	  totalValue: parseFloat(principalResult.rows[0].sum) || 0,
   	  
   	  // --- NEW Keys for the Mobile Dashboard Card ---
@@ -1032,7 +1043,7 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
   } catch (err) {
   	console.error("Dashboard Stats Error:", err.message);
   	res.status(500).send("Server Error while fetching dashboard stats.");
-  }
+    }
 });
 // --- END UPDATED DASHBOARD STATS ---
 
