@@ -995,7 +995,7 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
   	  principalResult,
   	  activeLoansResult,
   	  overdueLoansResult,
-  	  interestThisMonthPromise,
+  	  interestThisMonthResult,
   	  totalCustomersResult, 
   	  totalLoansResult,
   	  totalPaidResult,      
