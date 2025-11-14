@@ -323,11 +323,12 @@ app.get('/api/loans', authenticateToken, async (req, res) => {
   try {
   	await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
   	const query = `
-  	  SELECT l.id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date, l.status,
-  	 		  c.name AS customer_name, c.phone_number
-  	  FROM Loans l JOIN Customers c ON l.customer_id = c.id
-  	  WHERE l.status IN ('active', 'overdue', 'paid', 'forfeited')
-  	  ORDER BY l.pledge_date DESC`; 
+      SELECT 
+        l.id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date, l.status,
+        c.name AS customer_name, c.phone_number
+      FROM Loans l JOIN Customers c ON l.customer_id = c.id
+      WHERE l.status IN ('active', 'overdue', 'paid', 'forfeited')
+      ORDER BY l.pledge_date DESC`; 
   	const allLoans = await db.query(query);
   	res.json(allLoans.rows);
   } catch (err) {
