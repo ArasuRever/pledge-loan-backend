@@ -9,7 +9,7 @@ require('dotenv').config();
 
 const app = express();
 
-// --- ⭐ 1. CONFIGURE CORS FOR PRODUCTION ---
+// --- 1. CONFIGURE CORS FOR PRODUCTION ---
 const allowedOrigins = [
   'http://localhost:3000', // For local development
   'https://pledge-loan-frontend.onrender.com',
@@ -18,22 +18,22 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps, curl, or Postman)
-    if (!origin) return callback(null, true);
-    
-    // Check if the origin is in our allowed list
-    if (allowedOrigins.indexOf(origin) === -1) {
-      const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
-      return callback(new Error(msg), false);
-    }
-    return callback(null, true);
+  	// Allow requests with no origin (like mobile apps, curl, or Postman)
+  	if (!origin) return callback(null, true);
+  	
+  	// Check if the origin is in our allowed list
+  	if (allowedOrigins.indexOf(origin) === -1) {
+  	  const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+  	  return callback(new Error(msg), false);
+  	}
+  	return callback(null, true);
   }
 }));
 // --- END CORS CONFIG ---
 
 app.use(express.json());
 
-// --- ⭐ 2. USE RENDER'S PORT ---
+// --- 2. USE RENDER'S PORT ---
 const PORT = process.env.PORT || 3001; 
 // --- END PORT FIX ---
 
@@ -49,29 +49,28 @@ const authenticateToken = (req, res, next) => {
   const token = authHeader && authHeader.split(' ')[1]; // Format: "Bearer TOKEN"
 
   if (token == null) {
-    return res.sendStatus(401); // Unauthorized
+  	return res.sendStatus(401); // Unauthorized
   }
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      console.error("JWT Verification Error:", err.message); // Log JWT errors
-      return res.sendStatus(403); // Forbidden (token is invalid)
-    }
-    req.user = user;
-    next();
+  	if (err) {
+  	  console.error("JWT Verification Error:", err.message); // Log JWT errors
+  	  return res.sendStatus(403); // Forbidden (token is invalid)
+  	}
+  	req.user = user;
+  	next();
   });
 };
 
-// --- NEW: AUTHENTICATION MIDDLEWARE FOR ADMINS ---
+// --- AUTHENTICATION MIDDLEWARE FOR ADMINS ---
 const authorizeAdmin = (req, res, next) => {
   if (req.user.role !== 'admin') {
-    return res.sendStatus(403); // 403 Forbidden
+  	return res.sendStatus(403); // 403 Forbidden
   }
   next();
 };
 
-// --- ⭐ 3. GLOBAL INTEREST CALCULATION FUNCTION (MOVED HERE) ---
-// This function is now defined globally so all routes can use it.
+// --- 3. GLOBAL INTEREST CALCULATION FUNCTION (MOVED HERE) ---
 const calculateTotalMonthsFactor = (startDate, endDate, isInitialPrincipal) => {
   if (endDate <= startDate) return 0;
   let fullMonthsPassed = 0;
@@ -93,116 +92,113 @@ const calculateTotalMonthsFactor = (startDate, endDate, isInitialPrincipal) => {
 };
 // --- END GLOBAL FUNCTION ---
 
-
 // --- UTILITY ROUTE (Public) ---
 app.get('/', async (req, res) => {
   try {
-    const { rows } = await db.query('SELECT NOW()');
-    res.status(200).json({ message: "Welcome!", db_status: "Connected", db_time: rows[0].now });
+  	const { rows } = await db.query('SELECT NOW()');
+  	res.status(200).json({ message: "Welcome!", db_status: "Connected", db_time: rows[0].now });
   } catch (err) {
-    res.status(500).json({ message: "DB connection failed.", db_status: "Error" });
+  	res.status(500).json({ message: "DB connection failed.", db_status: "Error" });
   }
 });
 
 // --- AUTHENTICATION ROUTES ---
 app.post('/api/auth/register', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
-    const { username, password } = req.body;
-    if (!username || !password) {
-      return res.status(400).send('Username and password are required.');
-    }
+  	const { username, password } = req.body;
+  	if (!username || !password) {
+  	  return res.status(400).send('Username and password are required.');
+  	}
 
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
+  	const salt = await bcrypt.genSalt(10);
+  	const hashedPassword = await bcrypt.hash(password, salt);
 
-    // --- ⭐ FIX: Changed 'Users' to 'users' ---
-    const newUser = await db.query(
-      "INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id, username",
-      [username, hashedPassword]
-    );
-    res.status(201).json(newUser.rows[0]);
+  	const newUser = await db.query(
+  	  "INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id, username",
+  	  [username, hashedPassword]
+  	);
+  	res.status(201).json(newUser.rows[0]);
   } catch (err) {
-    if (err.code === '23505') {
-      return res.status(400).send('Username already exists.');
-    }
-    console.error("Registration Error:", err.message);
-    res.status(500).send('Server error during registration.');
+  	if (err.code === '23505') {
+  	  return res.status(400).send('Username already exists.');
+  	}
+  	console.error("Registration Error:", err.message);
+  	res.status(500).send('Server error during registration.');
   }
 });
 
 // --- USER MANAGEMENT ROUTES (Admin Only) ---
-// (These are all unchanged from your file)
 app.get('/api/users', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
-    const users = await db.query("SELECT id, username, role FROM users ORDER BY id ASC");
-    res.json(users.rows);
+  	const users = await db.query("SELECT id, username, role FROM users ORDER BY id ASC");
+  	res.json(users.rows);
   } catch (err) {
-    console.error("GET Users Error:", err.message);
-    res.status(500).send("Server Error");
+  	console.error("GET Users Error:", err.message);
+  	res.status(500).send("Server Error");
   }
 });
 
 app.post('/api/users/staff', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
-    const { username, password } = req.body;
-    if (!username || !password) {
-      return res.status(400).send('Username and password are required.');
-    }
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
-    const newUser = await db.query(
-      "INSERT INTO users (username, password, role) VALUES ($1, $2, 'staff') RETURNING id, username, role",
-      [username, hashedPassword]
-    );
-    res.status(201).json(newUser.rows[0]);
+  	const { username, password } = req.body;
+  	if (!username || !password) {
+  	  return res.status(400).send('Username and password are required.');
+  	}
+  	const salt = await bcrypt.genSalt(10);
+  	const hashedPassword = await bcrypt.hash(password, salt);
+  	const newUser = await db.query(
+  	  "INSERT INTO users (username, password, role) VALUES ($1, $2, 'staff') RETURNING id, username, role",
+  	  [username, hashedPassword]
+  	);
+  	res.status(201).json(newUser.rows[0]);
   } catch (err) {
-    if (err.code === '23505') { 
-      return res.status(400).send('Username already exists.');
-    }
-    console.error("Create Staff Error:", err.message);
-    res.status(500).send('Server error during staff creation.');
+  	if (err.code === '23505') { 
+  	  return res.status(400).send('Username already exists.');
+  	}
+  	console.error("Create Staff Error:", err.message);
+  	res.status(500).send('Server error during staff creation.');
   }
 });
 
 app.put('/api/users/change-password', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
-    const { userId, newPassword } = req.body;
-    if (!userId || !newPassword) {
-      return res.status(400).send('User ID and new password are required.');
-    }
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(newPassword, salt);
-    const result = await db.query(
-      "UPDATE users SET password = $1 WHERE id = $2 RETURNING id, username",
-      [hashedPassword, userId]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).send('User not found.');
-    }
-    res.status(200).json({ message: `Password for ${result.rows[0].username} updated successfully.` });
+  	const { userId, newPassword } = req.body;
+  	if (!userId || !newPassword) {
+  	  return res.status(400).send('User ID and new password are required.');
+  	}
+  	const salt = await bcrypt.genSalt(10);
+  	const hashedPassword = await bcrypt.hash(newPassword, salt);
+  	const result = await db.query(
+  	  "UPDATE users SET password = $1 WHERE id = $2 RETURNING id, username",
+  	  [hashedPassword, userId]
+  	);
+  	if (result.rows.length === 0) {
+  	  return res.status(404).send('User not found.');
+  	}
+  	res.status(200).json({ message: `Password for ${result.rows[0].username} updated successfully.` });
   } catch (err) {
-    console.error("Change Password Error:", err.message);
-    res.status(500).send('Server error changing password.');
+  	console.error("Change Password Error:", err.message);
+  	res.status(500).send('Server error changing password.');
   }
 });
 
 app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
-    const { id } = req.params;
-    const userId = parseInt(id);
-    if (isNaN(userId)) {
-      return res.status(400).send('Invalid user ID.');
-    }
-    if (userId === req.user.userId) {
-      return res.status(400).send('Admin users cannot delete their own account.');
-    }
-    const result = await db.query("DELETE FROM users WHERE id = $1 AND role = 'staff' RETURNING id, username", [userId]);
-    if (result.rows.length === 0) {
-      return res.status(404).send('Staff user not found or user is not a staff member.');
-    }
-    res.status(200).json({ message: `Staff user ${result.rows[0].username} deleted successfully.` });
+  	const { id } = req.params;
+  	const userId = parseInt(id);
+  	if (isNaN(userId)) {
+  	  return res.status(400).send('Invalid user ID.');
+  	}
+  	if (userId === req.user.userId) {
+  	  return res.status(400).send('Admin users cannot delete their own account.');
+  	}
+  	const result = await db.query("DELETE FROM users WHERE id = $1 AND role = 'staff' RETURNING id, username", [userId]);
+  	if (result.rows.length === 0) {
+  	  return res.status(404).send('Staff user not found or user is not a staff member.');
+  	}
+  	res.status(200).json({ message: `Staff user ${result.rows[0].username} deleted successfully.` });
   } catch (err) {
-    console.error("Delete Staff Error:", err.message);
+  	console.error("Delete Staff Error:", err.message);
   	res.status(500).send('Server error deleting user.');
   }
 });
@@ -210,18 +206,17 @@ app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res)
 // --- ⭐ 4. UPDATED LOGIN ROUTE (Fixes Mobile App & Web App Logout) ---
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { username, password } = req.body;
-    if (!username || !password) {
-      return res.status(400).send('Username and password are required.');
-    }
+  	const { username, password } = req.body;
+  	if (!username || !password) {
+  	  return res.status(400).send('Username and password are required.');
+  	}
 
-    const userResult = await db.query("SELECT * FROM users WHERE username = $1", [username]);
-    if (userResult.rows.length === 0) {
-      return res.status(401).send('Invalid credentials.');
-    }
-    const user = userResult.rows[0];
+  	const userResult = await db.query("SELECT * FROM users WHERE username = $1", [username]);
+  	if (userResult.rows.length === 0) {
+  	  return res.status(401).send('Invalid credentials.');
+  	}
+  	const user = userResult.rows[0];
 
-    // Use the correct 'password' column from your file
   	const validPassword = await bcrypt.compare(password, user.password); 
   	if (!validPassword) {
   	  return res.status(401).send('Invalid credentials.');
@@ -251,6 +246,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 // --- END UPDATED LOGIN ROUTE ---
+
 
 // --- CUSTOMER ROUTES (Protected - Unchanged) ---
 app.get('/api/customers', authenticateToken, async (req, res) => {
@@ -413,7 +409,8 @@ app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => 
   	await client.query('ROLLBACK'); console.error("Add Principal Error:", err.message); res.status(500).send("Server Error.");
   } finally { client.release(); }
 });
-// --- ⭐ 5. UPDATED LOAN DETAIL ROUTE (with Calculations) ---
+
+// --- ⭐ 5. UPDATED LOAN DETAIL ROUTE (with Calculations & Double-Count Fix) ---
 app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   try {
   	const id = parseInt(req.params.id);
@@ -442,7 +439,7 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   	const transactionsResult = await db.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [id]);
   	const transactions = transactionsResult.rows;
 
-  	// --- 4. START CALCULATIONS ---
+  	// --- 4. START CALCULATIONS (FIXED) ---
   	const currentPrincipalTotal = parseFloat(loanDetails.principal_amount);
   	const rate = parseFloat(loanDetails.interest_rate);
   	const pledgeDate = new Date(loanDetails.pledge_date);
@@ -452,7 +449,7 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   	let principalPaid = 0;
   	let interestPaid = 0;
   	let totalPaid = 0;
-    
+
     // This logic is now fixed to handle multiple disbursements correctly
     const disbursementTxs = [];
     const payments = [];
@@ -460,7 +457,6 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   	transactions.forEach(tx => {
   	  const amount = parseFloat(tx.amount_paid);
   	  if (tx.payment_type === 'disbursement') {
-        // Collect disbursement transactions
   	 	disbursementTxs.push({ amount: amount, date: new Date(tx.payment_date) });
   	  } else {
   	 	payments.push({ amount: amount, date: new Date(tx.payment_date), type: tx.payment_type });
@@ -699,6 +695,8 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
   }
 });
 // --- END UPDATED TRANSACTIONS ROUTE ---
+
+
 app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
   try {
   	const { id } = req.params;
@@ -728,7 +726,7 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
   	  return res.status(500).json({ error: "Internal error: Invalid interest rate." });
   	}
 
-  	// --- ⭐ FIX: Using the global function (calculateTotalMonthsFactor was removed from here) ---
+  	// --- ⭐ FIX: Using the global function ---
   	const disbursementsResult = await db.query(
   	  "SELECT amount_paid, payment_date FROM Transactions WHERE loan_id = $1 AND payment_type = 'disbursement' ORDER BY payment_date ASC", 
   	  [loanId]
@@ -754,7 +752,7 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
   	for (const event of disbursementEvents) {
   	  if (event.amount <= 0) continue;
   	  const monthsFactor = calculateTotalMonthsFactor(event.date, today, event.isInitial);
-  	  const monthlyInterestRateDecimal = monthlyInterestRatePercent / 100;
+      const monthlyInterestRateDecimal = monthlyInterestRatePercent / 100;
   	  totalInterest += event.amount * monthlyInterestRateDecimal * monthsFactor;
   	  if (event.isInitial) maxMonthsFactor = monthsFactor; 
   	}
@@ -774,7 +772,7 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
   	const closeLoan = await db.query("UPDATE Loans SET status = 'paid' WHERE id = $1 RETURNING *", [loanId]);
   	res.json({ message: `Loan successfully closed. Total Interest: ₹${totalInterest.toFixed(2)} (for ${totalMonthsFactorReport} months @ ${monthlyInterestRatePercent}% p.m.), Discount: ₹${discount.toFixed(2)}.`, loan: closeLoan.rows[0] });
 
-  } catch (err) {
+   } catch (err) {
   	console.error("Settle Loan Error:", err.message);
   	res.status(500).send("Server Error");
   }
@@ -794,7 +792,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
 
   	if (isNaN(loanId) || loanId <= 0) {
   		  return res.status(400).json({ error: "Invalid loan ID." });
-  	}
+   }
 
   	const client = await db.pool.connect();
   	try {
@@ -836,7 +834,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
   				  } else {
   					  newValCompare = newValue; 
   				  }
-  				  if (oldValue === null || oldValue === undefined) {
+   				  if (oldValue === null || oldValue === undefined) {
   					  oldValCompare = null;
   				  } else {
   					  const d = new Date(oldValue);
@@ -880,7 +878,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
 
   		  if (itemId) {
   			  addUpdate('pledgeditems', 'item_type', item_type, oldData.item_type, itemUpdateFields, itemUpdateValues);
-  			  addUpdate('pledgeditems', 'description', description, oldData.description, itemUpdateFields, itemUpdateValues);
+   			  addUpdate('pledgeditems', 'description', description, oldData.description, itemUpdateFields, itemUpdateValues);
   			  addUpdate('pledgeditems', 'quality', quality, oldData.quality, itemUpdateFields, itemUpdateValues);
   			  addUpdate('pledgeditems', 'weight', weight, oldData.weight, itemUpdateFields, itemUpdateValues);
 
@@ -901,7 +899,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
   			  console.log("Executing Loan Update:", loanUpdateQuery);
   			  console.log("With values:", loanUpdateValues);
   			  await client.query(loanUpdateQuery, loanUpdateValues);
-  		  }
+   		  }
 
   		  if (itemUpdateFields.length > 0 && itemId) {
   			  const itemSetClause = itemUpdateFields.map((field, i) => `${field} = $${i + 1}`).join(', ');
@@ -949,7 +947,7 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
   	try {
   		  const historyQuery = `
   			  SELECT field_changed, old_value, new_value, changed_at, changed_by_username
-  			  FROM loan_history
+ANA 			  FROM loan_history
   			  WHERE loan_id = $1
   			  ORDER BY changed_at DESC;
   		  `;
@@ -993,7 +991,7 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
   	  principalResult,
   	  activeLoansResult,
   	  overdueLoansResult,
-  	  interestThisMonthPromise,
+  	  interestThisMonthResult, // <-- THIS IS THE FIX
   	  totalCustomersResult, 
   	  totalLoansResult,
   	  totalPaidResult,      
@@ -1002,10 +1000,10 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
   	  principalPromise,
   	  activeLoansPromise,
   	  overdueLoansPromise,
-  	  interestThisMonthPromise,
+  	  interestThisMonthPromise, // This promise name is correct
   	  totalCustomersPromise,
   	  totalLoansPromise,
-  	  totalPaidPromise,     
+  	  totalPaidPromise,   	
   	  totalForfeitedPromise 
   	]);
 
@@ -1015,7 +1013,7 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
   	  totalPrincipalOut: parseFloat(principalResult.rows[0].sum) || 0,
   	  totalActiveLoans: parseInt(activeLoansResult.rows[0].count) || 0,
   	  totalOverdueLoans: parseInt(overdueLoansResult.rows[0].count) || 0,
-  	  interestCollectedThisMonth: parseFloat(interestThisMonthResult.rows[0].sum) || 0,
+  	  interestCollectedThisMonth: parseFloat(interestThisMonthResult.rows[0].sum) || 0, // Uses the result
 
   	  // --- Keys for Flutter Mobile App (Safe) ---
   	  totalCustomers: parseInt(totalCustomersResult.rows[0].count) || 0,
@@ -1034,7 +1032,7 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
   } catch (err) {
   	console.error("Dashboard Stats Error:", err.message);
   	res.status(500).send("Server Error while fetching dashboard stats.");
-    }
+  }
 });
 // --- END UPDATED DASHBOARD STATS ---
 
