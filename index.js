@@ -57,7 +57,8 @@ const authenticateToken = (req, res, next) => {
       console.error("JWT Verification Error:", err.message); // Log JWT errors
       return res.sendStatus(403); // Forbidden (token is invalid)
     }
-    req.user = user;
+    // --- THIS IS WHERE req.user is set ---
+    req.user = user; 
     next();
   });
 };
@@ -249,8 +250,6 @@ app.post('/api/auth/login', async (req, res) => {
 
 
 // --- CUSTOMER ROUTES (Protected) ---
-
-// --- MODIFIED: Filter out deleted customers ---
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
     const allCustomers = await db.query(
@@ -260,7 +259,6 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
   } catch (err) { console.error("GET Customers Error:", err.message); res.status(500).send("Server Error"); }
 });
 
-// --- MODIFIED: Filter out deleted customers ---
 app.get('/api/customers/:id', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
@@ -285,7 +283,6 @@ app.get('/api/customers/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// --- MODIFIED: Set is_deleted to false on creation ---
 app.post('/api/customers', authenticateToken, upload.single('photo'), async (req, res) => {
   try {
     const { name, phone_number, address } = req.body;
@@ -327,13 +324,11 @@ app.put('/api/customers/:id', authenticateToken, upload.single('photo'), async (
     } catch (err) { console.error("PUT Customer Error:", err.message); res.status(500).send("Server Error"); }
 });
 
-// --- NEW: Soft-delete a customer ---
 app.delete('/api/customers/:id', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid customer ID." });
 
-    // Check for active loans before deleting
     const activeLoanCheck = await db.query(
       "SELECT COUNT(*) FROM Loans WHERE customer_id = $1 AND status IN ('active', 'overdue')",
       [id]
@@ -342,7 +337,6 @@ app.delete('/api/customers/:id', authenticateToken, authorizeAdmin, async (req, 
       return res.status(400).json({ error: "Cannot delete customer. They have active or overdue loans." });
     }
 
-    // Soft-delete customer
     const deleteCustomerResult = await db.query(
       "UPDATE Customers SET is_deleted = true WHERE id = $1 RETURNING id, name",
       [id]
@@ -351,7 +345,6 @@ app.delete('/api/customers/:id', authenticateToken, authorizeAdmin, async (req, 
       return res.status(404).json({ error: "Customer not found." });
     }
 
-    // Also soft-delete their non-active loans
     await db.query(
       "UPDATE Loans SET status = 'deleted' WHERE customer_id = $1 AND status IN ('paid', 'forfeited')",
       [id]
@@ -365,8 +358,6 @@ app.delete('/api/customers/:id', authenticateToken, authorizeAdmin, async (req, 
 });
 
 // --- LOAN ROUTES (Protected) ---
-
-// --- MODIFIED: Added 'deleted' to the status list for filtering ---
 app.get('/api/loans', authenticateToken, async (req, res) => {
   try {
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
@@ -386,7 +377,6 @@ app.get('/api/loans', authenticateToken, async (req, res) => {
   }
 });
 
-// --- MODIFIED: Filter out deleted loans ---
 app.get('/api/loans/recent/created', authenticateToken, async (req, res) => {
   try {
     const query = `
@@ -435,7 +425,6 @@ app.get('/api/loans/overdue', authenticateToken, async (req, res) => {
   }
 });
 
-// --- MODIFIED: Filter out deleted loans ---
 app.get('/api/loans/find-by-book-number/:bookNumber', authenticateToken, async (req, res) => {
   try {
     const { bookNumber } = req.params;
@@ -451,13 +440,18 @@ app.get('/api/loans/find-by-book-number/:bookNumber', authenticateToken, async (
   }
 });
 
+// --- ⭐ MODIFICATION 1: Log username on new disbursement ---
 app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { additionalAmount } = req.body;
   const loanId = parseInt(id);
   const amountToAdd = parseFloat(additionalAmount);
+  // --- Get username from the token middleware ---
+  const username = req.user.username; 
+
   if (isNaN(loanId) || loanId <= 0) return res.status(400).json({ error: "Invalid loan ID." });
   if (isNaN(amountToAdd) || amountToAdd <= 0) return res.status(400).json({ error: "Invalid additional amount specified." });
+  
   const client = await db.pool.connect();
   try {
     await client.query('BEGIN');
@@ -465,10 +459,17 @@ app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => 
     if (loanResult.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Loan not found." }); }
     const currentLoan = loanResult.rows[0];
     if (currentLoan.status !== 'active' && currentLoan.status !== 'overdue') { await client.query('ROLLBACK'); return res.status(400).json({ error: `Cannot add principal to a loan with status '${currentLoan.status}'.` }); }
+    
     const currentPrincipal = parseFloat(currentLoan.principal_amount);
     const newPrincipal = currentPrincipal + amountToAdd;
     const updateResult = await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2 RETURNING *", [newPrincipal, loanId]);
-    await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date) VALUES ($1, $2, $3, NOW())", [loanId, amountToAdd, 'disbursement']);
+    
+    // --- Add username to the INSERT query ---
+    await client.query(
+      "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4)", 
+      [loanId, amountToAdd, 'disbursement', username]
+    );
+    
     await client.query('COMMIT');
     res.json({ message: `Successfully added ₹${amountToAdd.toFixed(2)}. New principal is ₹${newPrincipal.toFixed(2)}.`, loan: updateResult.rows[0] });
   } catch (err) {
@@ -476,17 +477,13 @@ app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => 
   } finally { client.release(); }
 });
 
-// --- ⭐ 5. UPDATED LOAN DETAIL ROUTE (with Calculations & Double-Count Fix) ---
-// --- MODIFIED: Filter out deleted loans ---
 app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid loan ID." });
     
-    // 1. Update status
     await db.query("UPDATE Loans SET status = 'overdue' WHERE id = $1 AND due_date < NOW() AND status = 'active'", [id]);
 
-    // 2. Get Loan, Item, and Customer Details
     const loanQuery = `
       SELECT 
         l.*, 
@@ -501,30 +498,27 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
     if (loanResult.rows.length === 0) return res.status(404).json({ error: "Loan not found." });
     let loanDetails = loanResult.rows[0];
 
-    // 3. Get All Transactions
-    // Order ASC so we can calculate principal paid correctly
-    const transactionsResult = await db.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [id]);
+    // --- MODIFIED: Also fetch username from transactions ---
+    const transactionsResult = await db.query(
+      "SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", 
+      [id]
+    );
     const transactions = transactionsResult.rows;
 
-    // --- 4. START CALCULATIONS (FIXED) ---
+    // --- (Calculations remain unchanged) ---
     const currentPrincipalTotal = parseFloat(loanDetails.principal_amount);
     const rate = parseFloat(loanDetails.interest_rate);
     const pledgeDate = new Date(loanDetails.pledge_date);
     const today = new Date();
-
     let totalInterestOwed = 0;
     let principalPaid = 0;
     let interestPaid = 0;
     let totalPaid = 0;
-
-    // This logic is now fixed to handle multiple disbursements correctly
     const disbursementTxs = [];
     const payments = [];
-
     transactions.forEach(tx => {
       const amount = parseFloat(tx.amount_paid);
       if (tx.payment_type === 'disbursement') {
-        // Collect disbursement transactions
         disbursementTxs.push({ amount: amount, date: new Date(tx.payment_date) });
       } else {
         payments.push({ amount: amount, date: new Date(tx.payment_date), type: tx.payment_type });
@@ -536,39 +530,26 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
         }
       }
     });
-
-    // Now, correctly figure out the initial principal vs. later disbursements
     const subsequentDisbursementsSum = disbursementTxs.reduce((sum, tx) => sum + tx.amount, 0);
-    // This is the principal amount from the Loans table, which is the *total*
     const initialPrincipal = currentPrincipalTotal - subsequentDisbursementsSum; 
-    
-    // Build the final list of all principal events
     const disbursements = [];
     if (initialPrincipal > 0) {
         disbursements.push({ amount: initialPrincipal, date: pledgeDate, isInitial: true });
     }
-    // Add the other disbursements from the transaction table
     disbursements.push(...disbursementTxs.map(tx => ({ ...tx, isInitial: false })));
-    // --- END FIX for double-counting ---
-    
     const outstandingPrincipal = currentPrincipalTotal - principalPaid;
-
-    // Calculate interest for each disbursement
     disbursements.forEach(event => {
-        // Use the global calculation function
         const monthsFactor = calculateTotalMonthsFactor(event.date, today, event.isInitial);
         totalInterestOwed += event.amount * (rate / 100) * monthsFactor;
     });
-
     const outstandingInterest = totalInterestOwed - interestPaid;
     const amountDue = outstandingPrincipal + outstandingInterest;
-    // --- END OF CALCULATIONS ---
+    // --- (End Calculations) ---
 
-    // 5. Handle image data (same as before)
+    // Handle image data (unchanged)
     if (loanDetails.item_image_data) { const ib64 = loanDetails.item_image_data.toString('base64'); let mt = 'image/jpeg'; if (ib64.startsWith('/9j/')) mt = 'image/jpeg'; else if (ib64.startsWith('iVBORw0KGgo')) mt = 'image/png'; loanDetails.item_image_data_url = `data:${mt};base64,${ib64}`; } delete loanDetails.item_image_data;
     if (loanDetails.customer_image_url) { const cb64 = loanDetails.customer_image_url.toString('base64'); let mt = 'image/jpeg'; if (cb64.startsWith('/9j/')) mt = 'image/jpeg'; else if (cb64.startsWith('iVBORw0KGgo')) mt = 'image/png'; loanDetails.customer_image_url = `data:${mt};base64,${cb64}`; }
 
-    // 6. Send the new 'calculated' object in the response
     res.json({ 
         loanDetails: loanDetails, 
         // Send transactions DESC for the UI
@@ -585,11 +566,12 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
     });
   } catch (err) { console.error("GET Loan Details Error:", err.message); res.status(500).send("Server Error"); }
 });
-// --- END UPDATED LOAN DETAIL ROUTE ---
 
-
+// --- ⭐ MODIFICATION 2: Log username on new loan creation (for interest deduction) ---
 app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req, res) => {
   const client = await db.pool.connect();
+  // --- Get username from the token middleware ---
+  const username = req.user.username; 
   try {
     const { customer_id, principal_amount, interest_rate, book_loan_number, item_type, description, quality, weight, deductFirstMonthInterest } = req.body;
     const itemImageBuffer = req.file ? req.file.buffer : null;
@@ -600,7 +582,6 @@ app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req
         return res.status(400).send("Missing or invalid required loan/item fields (customer, principal, rate, book#, type, description).");
     }
     
-    // --- NEW: Check if customer is deleted ---
     const customerCheck = await client.query("SELECT is_deleted FROM Customers WHERE id = $1", [customer_id]);
     if (customerCheck.rows.length === 0 || customerCheck.rows[0].is_deleted) {
       return res.status(404).send("Customer not found or is in the recycle bin.");
@@ -618,12 +599,12 @@ app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req
       console.log(`Loan ${newLoanId}: Deducting first month's interest.`);
       const firstMonthInterest = principal * (rate / 100);
       if (firstMonthInterest > 0) {
-        // --- FIX: Removed invisible characters from this query ---
+        // --- Add username to the INSERT query ---
         const interestTxQuery = `
-          INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date)
-          VALUES ($1, $2, 'interest', NOW())
+          INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username)
+          VALUES ($1, $2, 'interest', NOW(), $3)
         `;
-        await client.query(interestTxQuery, [newLoanId, firstMonthInterest]);
+        await client.query(interestTxQuery, [newLoanId, firstMonthInterest, username]);
         console.log(`Loan ${newLoanId}: Logged pre-paid interest of ₹${firstMonthInterest}.`);
       }
     }
@@ -638,7 +619,6 @@ app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req
   } finally { client.release(); }
 });
 
-// --- MODIFIED: Filter out deleted loans ---
 app.get('/api/customers/:id/loans', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
@@ -655,11 +635,13 @@ app.get('/api/customers/:id/loans', authenticateToken, async (req, res) => {
   } catch (err) { console.error("GET Customer Loans Error:", err.message); res.status(500).send("Server Error"); }
 });
 
-// --- ⭐ 6. UPDATED "SMART" TRANSACTIONS ROUTE (Fixes 'details' & 'calculate' bug) ---
+// --- ⭐ MODIFICATION 3: Log username on all payment types ---
 app.post('/api/transactions', authenticateToken, async (req, res) => {
   const client = await db.pool.connect();
+  // --- Get username from the token middleware ---
+  const username = req.user.username;
   try {
-    const { loan_id, amount_paid, payment_type } = req.body; // 'details' is removed
+    const { loan_id, amount_paid, payment_type } = req.body; 
     const loanId = parseInt(loan_id);
     const paymentAmount = parseFloat(amount_paid);
 
@@ -672,9 +654,9 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
     // --- CASE 1: Payment is for Principal (Simple Case) ---
     if (payment_type === 'principal') {
       const newTransaction = await client.query(
-        // 'details' column is removed from query
-        "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date) VALUES ($1, $2, $3, NOW()) RETURNING *", 
-        [loanId, paymentAmount, 'principal']
+        // --- Add username to the INSERT query ---
+        "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", 
+        [loanId, paymentAmount, 'principal', username]
       );
       await client.query('COMMIT');
       return res.status(201).json([newTransaction.rows[0]]); // Return as array
@@ -683,32 +665,20 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
     // --- CASE 2: Payment is for Interest (Complex Case) ---
     if (payment_type === 'interest') {
       
-      // 1. Get all data needed for calculation
+      // (Get data and run calculations - unchanged)
       const loanResult = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
-      if (loanResult.rows.length === 0) {
-        throw new Error('Loan not found.');
-      }
+      if (loanResult.rows.length === 0) { throw new Error('Loan not found.'); }
       const loan = loanResult.rows[0];
-      
-      // --- NEW: Check for deleted loan ---
-      if (loan.status === 'deleted') {
-          throw new Error('Cannot add transaction to a deleted loan.');
-      }
-
+      if (loan.status === 'deleted') { throw new Error('Cannot add transaction to a deleted loan.'); }
       const transactionsResult = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
       const transactions = transactionsResult.rows;
-
-      // 2. Run the calculation
       const principal = parseFloat(loan.principal_amount);
       const rate = parseFloat(loan.interest_rate);
       const pledgeDate = new Date(loan.pledge_date);
       const today = new Date();
-
       let totalInterestOwed = 0;
       let interestPaid = 0;
       let principalPaid = 0;
-
-      // This logic is now fixed to handle multiple disbursements correctly
       const disbursementTxs = [];
       transactions.forEach(tx => {
         const amount = parseFloat(tx.amount_paid);
@@ -720,27 +690,21 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
           interestPaid += amount;
         }
       });
-
       const subsequentDisbursementsSum = disbursementTxs.reduce((sum, tx) => sum + tx.amount, 0);
       const initialPrincipal = principal - subsequentDisbursementsSum;
-      
       const disbursements = [];
       if (initialPrincipal > 0) {
           disbursements.push({ amount: initialPrincipal, date: pledgeDate, isInitial: true });
       }
       disbursements.push(...disbursementTxs.map(tx => ({ ...tx, isInitial: false })));
-
       disbursements.forEach(event => {
-          // Use the global calculateTotalMonthsFactor function
           const monthsFactor = calculateTotalMonthsFactor(event.date, today, event.isInitial);
           totalInterestOwed += event.amount * (rate / 100) * monthsFactor;
       });
-
       const outstandingInterest = totalInterestOwed - interestPaid;
 
-      // --- 3. The new splitting logic ---
+      // --- 3. The new splitting logic (with username) ---
       if (paymentAmount > outstandingInterest) {
-        // Payment is MORE than interest due
         const interestPayment = outstandingInterest > 0 ? outstandingInterest : 0; 
         const principalPayment = paymentAmount - interestPayment; 
         let createdTransactions = [];
@@ -748,16 +712,18 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
         // Log the interest part
         if (interestPayment > 0) {
           const interestTx = await client.query(
-            "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date) VALUES ($1, $2, 'interest', NOW()) RETURNING *",
-            [loanId, interestPayment]
+            // --- Add username to the INSERT query ---
+            "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3) RETURNING *",
+            [loanId, interestPayment, username]
           );
           createdTransactions.push(interestTx.rows[0]);
         }
         
         // Log the leftover principal part
         const principalTx = await client.query(
-          "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date) VALUES ($1, $2, 'principal', NOW()) RETURNING *",
-          [loanId, principalPayment]
+          // --- Add username to the INSERT query ---
+          "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3) RETURNING *",
+          [loanId, principalPayment, username]
         );
         createdTransactions.push(principalTx.rows[0]);
         
@@ -766,8 +732,9 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
       } else {
         // Simple case: Payment is less than or equal to interest due
         const newTransaction = await client.query(
-          "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date) VALUES ($1, $2, 'interest', NOW()) RETURNING *",
-          [loanId, paymentAmount]
+          // --- Add username to the INSERT query ---
+          "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3) RETURNING *",
+          [loanId, paymentAmount, username]
         );
         await client.query('COMMIT');
         return res.status(201).json([newTransaction.rows[0]]); // Return as array
@@ -776,8 +743,9 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
 
     // Fallback for any other payment_type
     const newTransaction = await client.query(
-      "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date) VALUES ($1, $2, $3, NOW()) RETURNING *", 
-      [loanId, paymentAmount, payment_type]
+      // --- Add username to the INSERT query ---
+      "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", 
+      [loanId, paymentAmount, payment_type, username]
     );
     await client.query('COMMIT');
     return res.status(201).json([newTransaction.rows[0]]); // Return as array
@@ -823,7 +791,6 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: "Internal error: Invalid interest rate." });
     }
 
-    // --- ⭐ FIX: Using the global function ---
     const disbursementsResult = await db.query(
       "SELECT amount_paid, payment_date FROM Transactions WHERE loan_id = $1 AND payment_type = 'disbursement' ORDER BY payment_date ASC", 
       [loanId]
@@ -875,7 +842,6 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
   }
 });
 
-// --- NEW: Soft-delete a loan ---
 app.delete('/api/loans/:id', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
@@ -944,7 +910,6 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
         const oldData = currentResult.rows[0];
         const itemId = oldData.item_id;
 
-        // --- NEW: Check if loan is deleted ---
         if (oldData.status === 'deleted') {
             await client.query('ROLLBACK');
             return res.status(400).json({ error: "Cannot edit a deleted loan. Please restore it first." });
@@ -1093,13 +1058,10 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
     }
 });
 
-// --- ⭐ 7. UPDATED DASHBOARD STATS (Fixes duplicate variable name) ---
-// --- MODIFIED: Filter out deleted customers and loans from stats ---
 app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
 
-    // 1. Queries for the React Web App
     const principalPromise = db.query(
       "SELECT SUM(principal_amount) FROM Loans WHERE status = 'active' OR status = 'overdue'"
     );
@@ -1112,25 +1074,20 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
     const interestThisMonthPromise = db.query(
       "SELECT SUM(amount_paid) FROM Transactions WHERE payment_type = 'interest' AND payment_date >= date_trunc('month', CURRENT_DATE)"
     );
-
-    // 2. Queries for the Flutter Mobile App
     const totalCustomersPromise = db.query(
-      "SELECT COUNT(*) FROM Customers WHERE is_deleted = false" // MODIFIED
+      "SELECT COUNT(*) FROM Customers WHERE is_deleted = false"
     );
     const totalLoansPromise = db.query(
-      "SELECT COUNT(*) FROM Loans WHERE status != 'deleted'" // MODIFIED
+      "SELECT COUNT(*) FROM Loans WHERE status != 'deleted'"
     ); 
-
-    // --- 3. NEW QUERIES FOR LOAN STATUSES ---
     const totalPaidPromise = db.query("SELECT COUNT(*) FROM Loans WHERE status = 'paid'");
     const totalForfeitedPromise = db.query("SELECT COUNT(*) FROM Loans WHERE status = 'forfeited'");
 
-    // 4. Wait for ALL queries to finish
     const [
       principalResult,
       activeLoansResult,
       overdueLoansResult,
-      interestThisMonthResult, // <-- THIS IS THE FIX (was 'interestThisMonthPromise')
+      interestThisMonthResult,
       totalCustomersResult, 
       totalLoansResult,
       totalPaidResult,       
@@ -1139,27 +1096,21 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
       principalPromise,
       activeLoansPromise,
       overdueLoansPromise,
-      interestThisMonthPromise, // This promise name is correct
+      interestThisMonthPromise,
       totalCustomersPromise,
       totalLoansPromise,
       totalPaidPromise,     
       totalForfeitedPromise 
     ]);
 
-    // 5. Build the combined stats object
     const stats = {
-      // --- Keys for React Web App (Safe) ---
       totalPrincipalOut: parseFloat(principalResult.rows[0].sum) || 0,
       totalActiveLoans: parseInt(activeLoansResult.rows[0].count) || 0,
       totalOverdueLoans: parseInt(overdueLoansResult.rows[0].count) || 0,
-      interestCollectedThisMonth: parseFloat(interestThisMonthResult.rows[0].sum) || 0, // Uses the result
-
-      // --- Keys for Flutter Mobile App (Safe) ---
+      interestCollectedThisMonth: parseFloat(interestThisMonthResult.rows[0].sum) || 0,
       totalCustomers: parseInt(totalCustomersResult.rows[0].count) || 0,
       totalLoans: parseInt(totalLoansResult.rows[0].count) || 0,
       totalValue: parseFloat(principalResult.rows[0].sum) || 0,
-      
-      // --- NEW Keys for the Mobile Dashboard Card ---
       loansActive: parseInt(activeLoansResult.rows[0].count) || 0,
       loansOverdue: parseInt(overdueLoansResult.rows[0].count) || 0,
       loansPaid: parseInt(totalPaidResult.rows[0].count) || 0,
@@ -1173,9 +1124,7 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
     res.status(500).send("Server Error while fetching dashboard stats.");
   }
 });
-// --- END UPDATED DASHBOARD STATS ---
 
-// --- NEW: RECYCLE BIN ROUTES (Admin Only) ---
 app.get('/api/recycle-bin/deleted', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const deletedCustomersPromise = db.query(
@@ -1185,7 +1134,7 @@ app.get('/api/recycle-bin/deleted', authenticateToken, authorizeAdmin, async (re
       `SELECT l.id, l.book_loan_number, c.name as customer_name, 'Loan' as type 
        FROM Loans l 
        JOIN Customers c ON l.customer_id = c.id
-       WHERE l.status = 'deleted' AND c.is_deleted = false` // Only show loans whose parent customer is NOT deleted
+       WHERE l.status = 'deleted' AND c.is_deleted = false`
     );
 
     const [deletedCustomers, deletedLoans] = await Promise.all([
@@ -1208,7 +1157,6 @@ app.post('/api/customers/:id/restore', authenticateToken, authorizeAdmin, async 
     const id = parseInt(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid customer ID." });
 
-    // Restore customer
     const restoreCustomerResult = await db.query(
       "UPDATE Customers SET is_deleted = false WHERE id = $1 RETURNING id, name",
       [id]
@@ -1217,9 +1165,8 @@ app.post('/api/customers/:id/restore', authenticateToken, authorizeAdmin, async 
       return res.status(404).json({ error: "Customer not found in recycle bin." });
     }
 
-    // Also restore their associated 'deleted' loans (but not active ones, as they shouldn't exist)
     await db.query(
-      "UPDATE Loans SET status = 'paid' WHERE customer_id = $1 AND status = 'deleted'", // Restore as 'paid'
+      "UPDATE Loans SET status = 'paid' WHERE customer_id = $1 AND status = 'deleted'",
       [id]
     );
 
@@ -1233,9 +1180,8 @@ app.post('/api/customers/:id/restore', authenticateToken, authorizeAdmin, async 
 app.post('/api/loans/:id/restore', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    if (isNaN(id)) return res.status(400).json({ error: "Invalid loan ID." });
+    if (isNaN(id)) return res.status(4G00).json({ error: "Invalid loan ID." });
 
-    // Check if customer is also deleted
     const customerCheck = await db.query(
       "SELECT c.is_deleted FROM Customers c JOIN Loans l ON l.customer_id = c.id WHERE l.id = $1",
       [id]
@@ -1247,9 +1193,8 @@ app.post('/api/loans/:id/restore', authenticateToken, authorizeAdmin, async (req
       return res.status(400).json({ error: "Cannot restore this loan. Its owner, the customer, is also in the recycle bin. Please restore the customer first." });
     }
 
-    // Restore loan
     const restoreLoanResult = await db.query(
-      "UPDATE Loans SET status = 'paid' WHERE id = $1 AND status = 'deleted' RETURNING id, book_loan_number", // Restore as 'paid'
+      "UPDATE Loans SET status = 'paid' WHERE id = $1 AND status = 'deleted' RETURNING id, book_loan_number",
       [id]
     );
     if (restoreLoanResult.rows.length === 0) {
@@ -1262,8 +1207,6 @@ app.post('/api/loans/:id/restore', authenticateToken, authorizeAdmin, async (req
     res.status(500).send("Server Error");
   }
 });
-// --- END RECYCLE BIN ROUTES ---
-
 
 // --- START THE SERVER ---
 app.listen(PORT, () => {
