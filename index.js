@@ -1180,7 +1180,9 @@ app.post('/api/customers/:id/restore', authenticateToken, authorizeAdmin, async 
 app.post('/api/loans/:id/restore', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    if (isNaN(id)) return res.status(4G00).json({ error: "Invalid loan ID." });
+    // --- THIS IS THE FIX ---
+    if (isNaN(id)) return res.status(400).json({ error: "Invalid loan ID." });
+    // --- END OF FIX ---
 
     const customerCheck = await db.query(
       "SELECT c.is_deleted FROM Customers c JOIN Loans l ON l.customer_id = c.id WHERE l.id = $1",
