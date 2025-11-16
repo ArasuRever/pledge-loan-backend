@@ -248,19 +248,27 @@ app.post('/api/auth/login', async (req, res) => {
 // --- END UPDATED LOGIN ROUTE ---
 
 
-// --- CUSTOMER ROUTES (Protected - Unchanged) ---
+// --- CUSTOMER ROUTES (Protected) ---
+
+// --- MODIFIED: Filter out deleted customers ---
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
-    const allCustomers = await db.query("SELECT id, name, phone_number, address FROM Customers ORDER BY name ASC");
+    const allCustomers = await db.query(
+      "SELECT id, name, phone_number, address FROM Customers WHERE is_deleted = false ORDER BY name ASC"
+    );
     res.json(allCustomers.rows);
   } catch (err) { console.error("GET Customers Error:", err.message); res.status(500).send("Server Error"); }
 });
 
+// --- MODIFIED: Filter out deleted customers ---
 app.get('/api/customers/:id', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
-    const customerResult = await db.query("SELECT * FROM Customers WHERE id = $1", [id]);
+    const customerResult = await db.query(
+      "SELECT * FROM Customers WHERE id = $1 AND is_deleted = false", 
+      [id]
+    );
     if (customerResult.rows.length === 0) return res.status(404).json({ error: "Customer not found." });
     const customer = customerResult.rows[0];
     if (customer.customer_image_url) {
@@ -277,13 +285,14 @@ app.get('/api/customers/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// --- MODIFIED: Set is_deleted to false on creation ---
 app.post('/api/customers', authenticateToken, upload.single('photo'), async (req, res) => {
   try {
     const { name, phone_number, address } = req.body;
     const imageBuffer = req.file ? req.file.buffer : null;
     if (!name || !phone_number) return res.status(400).json({ error: 'Name and phone are required.' });
     const newCustomerResult = await db.query(
-      "INSERT INTO Customers (name, phone_number, address, customer_image_url) VALUES ($1, $2, $3, $4) RETURNING id, name, phone_number, address",
+      "INSERT INTO Customers (name, phone_number, address, customer_image_url, is_deleted) VALUES ($1, $2, $3, $4, false) RETURNING id, name, phone_number, address",
       [name, phone_number, address, imageBuffer]
     );
     res.status(201).json(newCustomerResult.rows[0]);
@@ -306,10 +315,10 @@ app.put('/api/customers/:id', authenticateToken, upload.single('photo'), async (
 
         let query; let values;
         if (updateImage) {
-          query = "UPDATE Customers SET name = $1, phone_number = $2, address = $3, customer_image_url = $4 WHERE id = $5 RETURNING id, name, phone_number, address";
+          query = "UPDATE Customers SET name = $1, phone_number = $2, address = $3, customer_image_url = $4 WHERE id = $5 AND is_deleted = false RETURNING id, name, phone_number, address";
           values = [name, phone_number, address, imageBuffer, id];
         } else {
-          query = "UPDATE Customers SET name = $1, phone_number = $2, address = $3 WHERE id = $4 RETURNING id, name, phone_number, address";
+          query = "UPDATE Customers SET name = $1, phone_number = $2, address = $3 WHERE id = $4 AND is_deleted = false RETURNING id, name, phone_number, address";
           values = [name, phone_number, address, id];
         }
         const updateCustomerResult = await db.query(query, values);
@@ -318,7 +327,46 @@ app.put('/api/customers/:id', authenticateToken, upload.single('photo'), async (
     } catch (err) { console.error("PUT Customer Error:", err.message); res.status(500).send("Server Error"); }
 });
 
-// --- LOAN ROUTES (Protected & Ordered Correctly - Unchanged) ---
+// --- NEW: Soft-delete a customer ---
+app.delete('/api/customers/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) return res.status(400).json({ error: "Invalid customer ID." });
+
+    // Check for active loans before deleting
+    const activeLoanCheck = await db.query(
+      "SELECT COUNT(*) FROM Loans WHERE customer_id = $1 AND status IN ('active', 'overdue')",
+      [id]
+    );
+    if (parseInt(activeLoanCheck.rows[0].count) > 0) {
+      return res.status(400).json({ error: "Cannot delete customer. They have active or overdue loans." });
+    }
+
+    // Soft-delete customer
+    const deleteCustomerResult = await db.query(
+      "UPDATE Customers SET is_deleted = true WHERE id = $1 RETURNING id, name",
+      [id]
+    );
+    if (deleteCustomerResult.rows.length === 0) {
+      return res.status(404).json({ error: "Customer not found." });
+    }
+
+    // Also soft-delete their non-active loans
+    await db.query(
+      "UPDATE Loans SET status = 'deleted' WHERE customer_id = $1 AND status IN ('paid', 'forfeited')",
+      [id]
+    );
+
+    res.json({ message: `Customer '${deleteCustomerResult.rows[0].name}' and their closed loans have been moved to the recycle bin.` });
+  } catch (err) {
+    console.error("DELETE Customer Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
+// --- LOAN ROUTES (Protected) ---
+
+// --- MODIFIED: Added 'deleted' to the status list for filtering ---
 app.get('/api/loans', authenticateToken, async (req, res) => {
   try {
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
@@ -327,6 +375,7 @@ app.get('/api/loans', authenticateToken, async (req, res) => {
              c.name AS customer_name, c.phone_number
       FROM Loans l JOIN Customers c ON l.customer_id = c.id
       WHERE l.status IN ('active', 'overdue', 'paid', 'forfeited')
+      AND c.is_deleted = false
       ORDER BY l.pledge_date DESC`; 
     const allLoans = await db.query(query);
     res.json(allLoans.rows);
@@ -337,9 +386,16 @@ app.get('/api/loans', authenticateToken, async (req, res) => {
   }
 });
 
+// --- MODIFIED: Filter out deleted loans ---
 app.get('/api/loans/recent/created', authenticateToken, async (req, res) => {
   try {
-    const query = `SELECT l.id, l.principal_amount, c.name AS customer_name FROM Loans l LEFT JOIN Customers c ON l.customer_id = c.id ORDER BY l.created_at DESC LIMIT 5`;
+    const query = `
+      SELECT l.id, l.principal_amount, c.name AS customer_name 
+      FROM Loans l LEFT JOIN Customers c ON l.customer_id = c.id 
+      WHERE l.status != 'deleted' AND c.is_deleted = false
+      ORDER BY l.created_at DESC 
+      LIMIT 5
+    `;
     res.json((await db.query(query)).rows);
   } catch (err) {
     console.error("Recent Created Error:", err.message);
@@ -349,7 +405,13 @@ app.get('/api/loans/recent/created', authenticateToken, async (req, res) => {
 
 app.get('/api/loans/recent/closed', authenticateToken, async (req, res) => {
   try {
-    const query = `SELECT l.id, l.principal_amount, c.name AS customer_name FROM Loans l LEFT JOIN Customers c ON l.customer_id = c.id WHERE l.status = 'paid' ORDER BY l.created_at DESC LIMIT 5`;
+    const query = `
+      SELECT l.id, l.principal_amount, c.name AS customer_name 
+      FROM Loans l LEFT JOIN Customers c ON l.customer_id = c.id 
+      WHERE l.status = 'paid' AND c.is_deleted = false
+      ORDER BY l.created_at DESC 
+      LIMIT 5
+    `;
     res.json((await db.query(query)).rows);
   } catch (err) {
     console.error("Recent Closed Error:", err.message);
@@ -363,7 +425,7 @@ app.get('/api/loans/overdue', authenticateToken, async (req, res) => {
     const query = `
       SELECT l.id, l.due_date, c.name AS customer_name, l.principal_amount, l.book_loan_number, l.pledge_date
       FROM Loans l JOIN Customers c ON l.customer_id = c.id
-      WHERE l.status = 'overdue'
+      WHERE l.status = 'overdue' AND c.is_deleted = false
       ORDER BY l.due_date ASC`;
     const overdueLoans = await db.query(query);
     res.json(overdueLoans.rows);
@@ -373,10 +435,14 @@ app.get('/api/loans/overdue', authenticateToken, async (req, res) => {
   }
 });
 
+// --- MODIFIED: Filter out deleted loans ---
 app.get('/api/loans/find-by-book-number/:bookNumber', authenticateToken, async (req, res) => {
   try {
     const { bookNumber } = req.params;
-    const result = await db.query("SELECT id FROM Loans WHERE book_loan_number = $1", [bookNumber]);
+    const result = await db.query(
+      "SELECT id FROM Loans WHERE book_loan_number = $1 AND status != 'deleted'", 
+      [bookNumber]
+    );
     if (result.rows.length === 0) return res.status(404).json({ error: "No loan found." });
     res.json({ loanId: result.rows[0].id });
   } catch (err) {
@@ -411,6 +477,7 @@ app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => 
 });
 
 // --- ⭐ 5. UPDATED LOAN DETAIL ROUTE (with Calculations & Double-Count Fix) ---
+// --- MODIFIED: Filter out deleted loans ---
 app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
@@ -428,7 +495,7 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
       FROM Loans l 
       LEFT JOIN PledgedItems pi ON l.id = pi.loan_id 
       JOIN Customers c ON l.customer_id = c.id 
-      WHERE l.id = $1
+      WHERE l.id = $1 AND l.status != 'deleted' AND c.is_deleted = false
     `;
     const loanResult = await db.query(loanQuery, [id]);
     if (loanResult.rows.length === 0) return res.status(404).json({ error: "Loan not found." });
@@ -532,6 +599,12 @@ app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req
     if (!customer_id || isNaN(principal) || principal <= 0 || isNaN(rate) || rate <= 0 || !book_loan_number || !item_type || !description) {
         return res.status(400).send("Missing or invalid required loan/item fields (customer, principal, rate, book#, type, description).");
     }
+    
+    // --- NEW: Check if customer is deleted ---
+    const customerCheck = await client.query("SELECT is_deleted FROM Customers WHERE id = $1", [customer_id]);
+    if (customerCheck.rows.length === 0 || customerCheck.rows[0].is_deleted) {
+      return res.status(404).send("Customer not found or is in the recycle bin.");
+    }
 
     await client.query('BEGIN');
     const loanQuery = `INSERT INTO Loans (customer_id, principal_amount, interest_rate, book_loan_number) VALUES ($1, $2, $3, $4) RETURNING id`;
@@ -565,12 +638,18 @@ app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req
   } finally { client.release(); }
 });
 
+// --- MODIFIED: Filter out deleted loans ---
 app.get('/api/customers/:id/loans', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
       if (isNaN(id)) return res.status(400).json({ error: "Invalid customer ID." });
     await db.query("UPDATE Loans SET status = 'overdue' WHERE customer_id = $1 AND due_date < NOW() AND status = 'active'", [id]);
-    const query = ` SELECT l.id AS loan_id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date, l.status, pi.description FROM Loans l LEFT JOIN PledgedItems pi ON l.id = pi.loan_id WHERE l.customer_id = $1 ORDER BY l.pledge_date DESC`;
+    const query = `
+      SELECT l.id AS loan_id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date, l.status, pi.description 
+      FROM Loans l LEFT JOIN PledgedItems pi ON l.id = pi.loan_id 
+      WHERE l.customer_id = $1 AND l.status != 'deleted'
+      ORDER BY l.pledge_date DESC
+    `;
     const customerLoans = await db.query(query, [id]);
     res.json(customerLoans.rows);
   } catch (err) { console.error("GET Customer Loans Error:", err.message); res.status(500).send("Server Error"); }
@@ -610,6 +689,12 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
         throw new Error('Loan not found.');
       }
       const loan = loanResult.rows[0];
+      
+      // --- NEW: Check for deleted loan ---
+      if (loan.status === 'deleted') {
+          throw new Error('Cannot add transaction to a deleted loan.');
+      }
+
       const transactionsResult = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
       const transactions = transactionsResult.rows;
 
@@ -790,6 +875,37 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
   }
 });
 
+// --- NEW: Soft-delete a loan ---
+app.delete('/api/loans/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) return res.status(400).json({ error: "Invalid loan ID." });
+
+    const loanResult = await db.query(
+      "SELECT status, book_loan_number FROM Loans WHERE id = $1", 
+      [id]
+    );
+    if (loanResult.rows.length === 0) {
+      return res.status(404).json({ error: "Loan not found." });
+    }
+    
+    const currentStatus = loanResult.rows[0].status;
+    if (currentStatus === 'active' || currentStatus === 'overdue') {
+      return res.status(400).json({ error: "Cannot delete an active or overdue loan. Please settle it first." });
+    }
+
+    const deleteLoanResult = await db.query(
+      "UPDATE Loans SET status = 'deleted' WHERE id = $1 RETURNING id, book_loan_number",
+      [id]
+    );
+
+    res.json({ message: `Loan #${deleteLoanResult.rows[0].book_loan_number} moved to recycle bin.` });
+  } catch (err) {
+    console.error("DELETE Loan Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
 app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (req, res) => {
     const { id } = req.params;
     const loanId = parseInt(id);
@@ -812,7 +928,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
 
         const currentDataQuery = `
             SELECT
-                l.book_loan_number, l.interest_rate, l.pledge_date, l.due_date,
+                l.book_loan_number, l.interest_rate, l.pledge_date, l.due_date, l.status,
                 pi.id AS item_id, pi.item_type, pi.description, pi.quality, pi.weight, pi.item_image_data
             FROM "loans" l
             LEFT JOIN "pledgeditems" pi ON l.id = pi.loan_id
@@ -827,6 +943,12 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
         }
         const oldData = currentResult.rows[0];
         const itemId = oldData.item_id;
+
+        // --- NEW: Check if loan is deleted ---
+        if (oldData.status === 'deleted') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "Cannot edit a deleted loan. Please restore it first." });
+        }
 
         const historyLogs = [];
         const loanUpdateFields = [];
@@ -972,6 +1094,7 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
 });
 
 // --- ⭐ 7. UPDATED DASHBOARD STATS (Fixes duplicate variable name) ---
+// --- MODIFIED: Filter out deleted customers and loans from stats ---
 app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
@@ -991,8 +1114,12 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
     );
 
     // 2. Queries for the Flutter Mobile App
-    const totalCustomersPromise = db.query("SELECT COUNT(*) FROM Customers");
-    const totalLoansPromise = db.query("SELECT COUNT(*) FROM Loans"); // Counts *all* loans
+    const totalCustomersPromise = db.query(
+      "SELECT COUNT(*) FROM Customers WHERE is_deleted = false" // MODIFIED
+    );
+    const totalLoansPromise = db.query(
+      "SELECT COUNT(*) FROM Loans WHERE status != 'deleted'" // MODIFIED
+    ); 
 
     // --- 3. NEW QUERIES FOR LOAN STATUSES ---
     const totalPaidPromise = db.query("SELECT COUNT(*) FROM Loans WHERE status = 'paid'");
@@ -1047,6 +1174,96 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
   }
 });
 // --- END UPDATED DASHBOARD STATS ---
+
+// --- NEW: RECYCLE BIN ROUTES (Admin Only) ---
+app.get('/api/recycle-bin/deleted', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const deletedCustomersPromise = db.query(
+      "SELECT id, name, phone_number, 'Customer' as type FROM Customers WHERE is_deleted = true"
+    );
+    const deletedLoansPromise = db.query(
+      `SELECT l.id, l.book_loan_number, c.name as customer_name, 'Loan' as type 
+       FROM Loans l 
+       JOIN Customers c ON l.customer_id = c.id
+       WHERE l.status = 'deleted' AND c.is_deleted = false` // Only show loans whose parent customer is NOT deleted
+    );
+
+    const [deletedCustomers, deletedLoans] = await Promise.all([
+      deletedCustomersPromise,
+      deletedLoansPromise
+    ]);
+
+    res.json({
+      customers: deletedCustomers.rows,
+      loans: deletedLoans.rows
+    });
+  } catch (err) {
+    console.error("GET Recycle Bin Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
+app.post('/api/customers/:id/restore', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) return res.status(400).json({ error: "Invalid customer ID." });
+
+    // Restore customer
+    const restoreCustomerResult = await db.query(
+      "UPDATE Customers SET is_deleted = false WHERE id = $1 RETURNING id, name",
+      [id]
+    );
+    if (restoreCustomerResult.rows.length === 0) {
+      return res.status(404).json({ error: "Customer not found in recycle bin." });
+    }
+
+    // Also restore their associated 'deleted' loans (but not active ones, as they shouldn't exist)
+    await db.query(
+      "UPDATE Loans SET status = 'paid' WHERE customer_id = $1 AND status = 'deleted'", // Restore as 'paid'
+      [id]
+    );
+
+    res.json({ message: `Customer '${restoreCustomerResult.rows[0].name}' and their loans have been restored.` });
+  } catch (err) {
+    console.error("RESTORE Customer Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
+app.post('/api/loans/:id/restore', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) return res.status(400).json({ error: "Invalid loan ID." });
+
+    // Check if customer is also deleted
+    const customerCheck = await db.query(
+      "SELECT c.is_deleted FROM Customers c JOIN Loans l ON l.customer_id = c.id WHERE l.id = $1",
+      [id]
+    );
+    if (customerCheck.rows.length === 0) {
+       return res.status(404).json({ error: "Loan not found." });
+    }
+    if (customerCheck.rows[0].is_deleted) {
+      return res.status(400).json({ error: "Cannot restore this loan. Its owner, the customer, is also in the recycle bin. Please restore the customer first." });
+    }
+
+    // Restore loan
+    const restoreLoanResult = await db.query(
+      "UPDATE Loans SET status = 'paid' WHERE id = $1 AND status = 'deleted' RETURNING id, book_loan_number", // Restore as 'paid'
+      [id]
+    );
+    if (restoreLoanResult.rows.length === 0) {
+      return res.status(404).json({ error: "Loan not found in recycle bin." });
+    }
+
+    res.json({ message: `Loan #${restoreLoanResult.rows[0].book_loan_number} has been restored.` });
+  } catch (err) {
+    console.error("RESTORE Loan Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+// --- END RECYCLE BIN ROUTES ---
+
 
 // --- START THE SERVER ---
 app.listen(PORT, () => {
