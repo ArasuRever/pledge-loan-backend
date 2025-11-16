@@ -440,13 +440,11 @@ app.get('/api/loans/find-by-book-number/:bookNumber', authenticateToken, async (
   }
 });
 
-// --- ⭐ MODIFICATION 1: Log username on new disbursement ---
 app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { additionalAmount } = req.body;
   const loanId = parseInt(id);
   const amountToAdd = parseFloat(additionalAmount);
-  // --- Get username from the token middleware ---
   const username = req.user.username; 
 
   if (isNaN(loanId) || loanId <= 0) return res.status(400).json({ error: "Invalid loan ID." });
@@ -464,7 +462,6 @@ app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => 
     const newPrincipal = currentPrincipal + amountToAdd;
     const updateResult = await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2 RETURNING *", [newPrincipal, loanId]);
     
-    // --- Add username to the INSERT query ---
     await client.query(
       "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4)", 
       [loanId, amountToAdd, 'disbursement', username]
@@ -498,14 +495,13 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
     if (loanResult.rows.length === 0) return res.status(404).json({ error: "Loan not found." });
     let loanDetails = loanResult.rows[0];
 
-    // --- MODIFIED: Also fetch username from transactions ---
+    // --- We now fetch the username along with other transaction data ---
     const transactionsResult = await db.query(
       "SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", 
       [id]
     );
     const transactions = transactionsResult.rows;
 
-    // --- (Calculations remain unchanged) ---
     const currentPrincipalTotal = parseFloat(loanDetails.principal_amount);
     const rate = parseFloat(loanDetails.interest_rate);
     const pledgeDate = new Date(loanDetails.pledge_date);
@@ -544,15 +540,13 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
     });
     const outstandingInterest = totalInterestOwed - interestPaid;
     const amountDue = outstandingPrincipal + outstandingInterest;
-    // --- (End Calculations) ---
 
-    // Handle image data (unchanged)
     if (loanDetails.item_image_data) { const ib64 = loanDetails.item_image_data.toString('base64'); let mt = 'image/jpeg'; if (ib64.startsWith('/9j/')) mt = 'image/jpeg'; else if (ib64.startsWith('iVBORw0KGgo')) mt = 'image/png'; loanDetails.item_image_data_url = `data:${mt};base64,${ib64}`; } delete loanDetails.item_image_data;
     if (loanDetails.customer_image_url) { const cb64 = loanDetails.customer_image_url.toString('base64'); let mt = 'image/jpeg'; if (cb64.startsWith('/9j/')) mt = 'image/jpeg'; else if (cb64.startsWith('iVBORw0KGgo')) mt = 'image/png'; loanDetails.customer_image_url = `data:${mt};base64,${cb64}`; }
 
     res.json({ 
         loanDetails: loanDetails, 
-        // Send transactions DESC for the UI
+        // Send transactions DESC for the UI (with username included)
         transactions: transactions.sort((a, b) => new Date(b.payment_date) - new Date(a.payment_date)),
         calculated: {
           totalInterestOwed: totalInterestOwed.toFixed(2),
@@ -567,10 +561,8 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   } catch (err) { console.error("GET Loan Details Error:", err.message); res.status(500).send("Server Error"); }
 });
 
-// --- ⭐ MODIFICATION 2: Log username on new loan creation (for interest deduction) ---
 app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req, res) => {
   const client = await db.pool.connect();
-  // --- Get username from the token middleware ---
   const username = req.user.username; 
   try {
     const { customer_id, principal_amount, interest_rate, book_loan_number, item_type, description, quality, weight, deductFirstMonthInterest } = req.body;
@@ -599,7 +591,6 @@ app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req
       console.log(`Loan ${newLoanId}: Deducting first month's interest.`);
       const firstMonthInterest = principal * (rate / 100);
       if (firstMonthInterest > 0) {
-        // --- Add username to the INSERT query ---
         const interestTxQuery = `
           INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username)
           VALUES ($1, $2, 'interest', NOW(), $3)
@@ -635,10 +626,8 @@ app.get('/api/customers/:id/loans', authenticateToken, async (req, res) => {
   } catch (err) { console.error("GET Customer Loans Error:", err.message); res.status(500).send("Server Error"); }
 });
 
-// --- ⭐ MODIFICATION 3: Log username on all payment types ---
 app.post('/api/transactions', authenticateToken, async (req, res) => {
   const client = await db.pool.connect();
-  // --- Get username from the token middleware ---
   const username = req.user.username;
   try {
     const { loan_id, amount_paid, payment_type } = req.body; 
@@ -651,21 +640,17 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
 
     await client.query('BEGIN');
 
-    // --- CASE 1: Payment is for Principal (Simple Case) ---
     if (payment_type === 'principal') {
       const newTransaction = await client.query(
-        // --- Add username to the INSERT query ---
         "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", 
         [loanId, paymentAmount, 'principal', username]
       );
       await client.query('COMMIT');
-      return res.status(201).json([newTransaction.rows[0]]); // Return as array
+      return res.status(201).json([newTransaction.rows[0]]);
     }
 
-    // --- CASE 2: Payment is for Interest (Complex Case) ---
     if (payment_type === 'interest') {
       
-      // (Get data and run calculations - unchanged)
       const loanResult = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
       if (loanResult.rows.length === 0) { throw new Error('Loan not found.'); }
       const loan = loanResult.rows[0];
@@ -703,52 +688,44 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
       });
       const outstandingInterest = totalInterestOwed - interestPaid;
 
-      // --- 3. The new splitting logic (with username) ---
       if (paymentAmount > outstandingInterest) {
         const interestPayment = outstandingInterest > 0 ? outstandingInterest : 0; 
         const principalPayment = paymentAmount - interestPayment; 
         let createdTransactions = [];
 
-        // Log the interest part
         if (interestPayment > 0) {
           const interestTx = await client.query(
-            // --- Add username to the INSERT query ---
             "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3) RETURNING *",
             [loanId, interestPayment, username]
           );
           createdTransactions.push(interestTx.rows[0]);
         }
         
-        // Log the leftover principal part
         const principalTx = await client.query(
-          // --- Add username to the INSERT query ---
           "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3) RETURNING *",
           [loanId, principalPayment, username]
         );
         createdTransactions.push(principalTx.rows[0]);
         
         await client.query('COMMIT');
-        return res.status(201).json(createdTransactions); // Return both
+        return res.status(201).json(createdTransactions);
       } else {
-        // Simple case: Payment is less than or equal to interest due
         const newTransaction = await client.query(
-          // --- Add username to the INSERT query ---
           "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3) RETURNING *",
           [loanId, paymentAmount, username]
         );
         await client.query('COMMIT');
-        return res.status(201).json([newTransaction.rows[0]]); // Return as array
+        return res.status(201).json([newTransaction.rows[0]]);
       }
     }
 
     // Fallback for any other payment_type
     const newTransaction = await client.query(
-      // --- Add username to the INSERT query ---
       "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", 
       [loanId, paymentAmount, payment_type, username]
     );
     await client.query('COMMIT');
-    return res.status(201).json([newTransaction.rows[0]]); // Return as array
+    return res.status(201).json([newTransaction.rows[0]]);
 
   } catch (err) {
     await client.query('ROLLBACK');
@@ -1035,6 +1012,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
     }
 });
 
+// --- ⭐ THIS IS THE NEW COMBINED HISTORY ENDPOINT ---
 app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const loanId = parseInt(id);
@@ -1044,19 +1022,52 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
     }
 
     try {
+        // This query combines both tables and orders them by date
         const historyQuery = `
-            SELECT field_changed, old_value, new_value, changed_at, changed_by_username
-            FROM loan_history
+          (
+            -- Select all edit history
+            SELECT 
+              id,
+              changed_at, 
+              changed_by_username, 
+              'edit' AS event_type, 
+              field_changed, 
+              old_value, 
+              new_value, 
+              NULL AS amount_paid, 
+              NULL AS payment_type
+            FROM loan_history 
             WHERE loan_id = $1
-            ORDER BY changed_at DESC;
+          )
+          UNION ALL
+          (
+            -- Select all financial transactions
+            SELECT 
+              id,
+              payment_date AS changed_at, 
+              changed_by_username, 
+              'transaction' AS event_type, 
+              NULL AS field_changed, 
+              NULL AS old_value, 
+              NULL AS new_value, 
+              amount_paid, 
+              payment_type
+            FROM Transactions 
+            WHERE loan_id = $1
+          )
+          -- Order the combined results by the date, newest first
+          ORDER BY changed_at DESC;
         `;
+        
         const historyResult = await db.query(historyQuery, [loanId]);
         res.json(historyResult.rows);
+        
     } catch (err) {
         console.error(`Error fetching history for loan ${loanId}:`, err.message);
         res.status(500).send("Server Error fetching loan history.");
     }
 });
+// --- END OF NEW ENDPOINT ---
 
 app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
@@ -1180,9 +1191,7 @@ app.post('/api/customers/:id/restore', authenticateToken, authorizeAdmin, async 
 app.post('/api/loans/:id/restore', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    // --- THIS IS THE FIX ---
     if (isNaN(id)) return res.status(400).json({ error: "Invalid loan ID." });
-    // --- END OF FIX ---
 
     const customerCheck = await db.query(
       "SELECT c.is_deleted FROM Customers c JOIN Loans l ON l.customer_id = c.id WHERE l.id = $1",
