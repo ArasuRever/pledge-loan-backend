@@ -909,6 +909,52 @@ app.post('/api/customers/:id/restore', authenticateToken, authorizeAdmin, async 
   } catch (err) { console.error("RESTORE Customer Error:", err.message); res.status(500).send("Server Error"); }
 });
 
+// --- NEW: PERMANENT CUSTOMER DELETION (DESTRUCTIVE) ---
+app.delete('/api/customers/:id/permanent-delete', authenticateToken, authorizeAdmin, async (req, res) => {
+    const { id } = req.params;
+    const customerId = parseInt(id);
+    if (isNaN(customerId)) return res.status(400).json({ error: "Invalid customer ID." });
+    
+    const client = await db.pool.connect();
+    try {
+        await client.query('BEGIN');
+        
+        // 1. Get loan IDs for the customer
+        const loanIdsResult = await client.query("SELECT id FROM Loans WHERE customer_id = $1", [customerId]);
+        const loanIds = loanIdsResult.rows.map(row => row.id);
+
+        if (loanIds.length > 0) {
+            const loanIdString = loanIds.join(',');
+            // 2. Delete PledgedItems
+            await client.query(`DELETE FROM PledgedItems WHERE loan_id IN (${loanIdString})`);
+            // 3. Delete Transactions and Loan_History
+            await client.query(`DELETE FROM Transactions WHERE loan_id IN (${loanIdString})`);
+            await client.query(`DELETE FROM loan_history WHERE loan_id IN (${loanIdString})`);
+            // 4. Delete Loans
+            await client.query(`DELETE FROM Loans WHERE customer_id = $1`, [customerId]);
+        }
+
+        // 5. Delete Customer (only if is_deleted=true)
+        const deleteCustomerResult = await client.query("DELETE FROM Customers WHERE id = $1 AND is_deleted = true RETURNING name", [customerId]);
+        
+        if (deleteCustomerResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "Deleted customer not found." });
+        }
+
+        await client.query('COMMIT');
+        res.json({ message: `Customer '${deleteCustomerResult.rows[0].name}' and all associated data permanently deleted.` });
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error("PERMANENT DELETE Customer Error:", err.message);
+        res.status(500).send("Server Error during permanent deletion.");
+    } finally {
+        client.release();
+    }
+});
+// --- END NEW: PERMANENT CUSTOMER DELETION ---
+
 app.post('/api/loans/:id/restore', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
@@ -921,6 +967,43 @@ app.post('/api/loans/:id/restore', authenticateToken, authorizeAdmin, async (req
     res.json({ message: `Loan #${restoreLoanResult.rows[0].book_loan_number} has been restored.` });
   } catch (err) { console.error("RESTORE Loan Error:", err.message); res.status(500).send("Server Error"); }
 });
+
+// --- NEW: PERMANENT LOAN DELETION (DESTRUCTIVE) ---
+app.delete('/api/loans/:id/permanent-delete', authenticateToken, authorizeAdmin, async (req, res) => {
+    const { id } = req.params;
+    const loanId = parseInt(id);
+    if (isNaN(loanId)) return res.status(400).json({ error: "Invalid loan ID." });
+
+    const client = await db.pool.connect();
+    try {
+        await client.query('BEGIN');
+        
+        // 1. Delete PledgedItem
+        await client.query("DELETE FROM PledgedItems WHERE loan_id = $1", [loanId]);
+        // 2. Delete Transactions and Loan_History
+        await client.query("DELETE FROM Transactions WHERE loan_id = $1", [loanId]);
+        await client.query("DELETE FROM loan_history WHERE loan_id = $1", [loanId]);
+        
+        // 3. Delete Loan (only if status='deleted')
+        const deleteLoanResult = await client.query("DELETE FROM Loans WHERE id = $1 AND status = 'deleted' RETURNING book_loan_number", [loanId]);
+        
+        if (deleteLoanResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "Deleted loan not found." });
+        }
+
+        await client.query('COMMIT');
+        res.json({ message: `Loan #${deleteLoanResult.rows[0].book_loan_number} permanently deleted.` });
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error("PERMANENT DELETE Loan Error:", err.message);
+        res.status(500).send("Server Error during permanent deletion.");
+    } finally {
+        client.release();
+    }
+});
+// --- END NEW: PERMANENT LOAN DELETION ---
 
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
