@@ -773,33 +773,56 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
 // --- MODIFIED: Filter out deleted customers and loans from stats ---
 app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
+    // 1. Update overdue status first
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
-    const [principalResult, activeLoansResult, overdueLoansResult, interestThisMonthResult, totalCustomersResult, totalLoansResult, totalPaidResult, totalForfeitedResult] = await Promise.all([
-      db.query("SELECT SUM(principal_amount) FROM Loans WHERE status = 'active' OR status = 'overdue'"),
+
+    const [
+      principalResult, 
+      activeLoansResult, 
+      overdueLoansResult, 
+      interestThisMonthResult, 
+      totalCustomersResult, 
+      totalLoansResult, 
+      totalPaidResult, 
+      totalForfeitedResult,
+      // *** NEW: Query for the sum of Principal for ALL NON-DELETED Loans ***
+      totalDisbursedPrincipalResult 
+    ] = await Promise.all([
+      // 1. Outstanding Principal (Active or Overdue)
+      db.query("SELECT SUM(principal_amount) FROM Loans WHERE status = 'active' OR status = 'overdue'"), 
+      // 2. Counts
       db.query("SELECT COUNT(*) FROM Loans WHERE status = 'active' OR status = 'overdue'"),
       db.query("SELECT COUNT(*) FROM Loans WHERE status = 'overdue'"),
+      // 4. Interest This Month
       db.query("SELECT SUM(amount_paid) FROM Transactions WHERE payment_type = 'interest' AND payment_date >= date_trunc('month', CURRENT_DATE)"),
+      // 5. Counts
       db.query("SELECT COUNT(*) FROM Customers WHERE is_deleted = false"),
       db.query("SELECT COUNT(*) FROM Loans WHERE status != 'deleted'"), 
       db.query("SELECT COUNT(*) FROM Loans WHERE status = 'paid'"),
-      db.query("SELECT COUNT(*) FROM Loans WHERE status = 'forfeited'") 
+      db.query("SELECT COUNT(*) FROM Loans WHERE status = 'forfeited'"),
+      // *** NEW: The query that fixes the bug (Sum of all principal where status is NOT 'deleted') ***
+      db.query("SELECT SUM(principal_amount) FROM Loans WHERE status != 'deleted'") 
     ]);
+    
+    // Convert results, handling null/undefined sums
+    const totalDisbursedPrincipal = parseFloat(totalDisbursedPrincipalResult.rows[0].sum || 0);
+
     res.json({
-      totalPrincipalOut: parseFloat(principalResult.rows[0].sum) || 0,
-      totalActiveLoans: parseInt(activeLoansResult.rows[0].count) || 0,
-      totalOverdueLoans: parseInt(overdueLoansResult.rows[0].count) || 0,
-      interestCollectedThisMonth: parseFloat(interestThisMonthResult.rows[0].sum) || 0,
-      totalCustomers: parseInt(totalCustomersResult.rows[0].count) || 0,
-      totalLoans: parseInt(totalLoansResult.rows[0].count) || 0,
-      totalValue: parseFloat(principalResult.rows[0].sum) || 0,
-      loansActive: parseInt(activeLoansResult.rows[0].count) || 0,
-      loansOverdue: parseInt(overdueLoansResult.rows[0].count) || 0,
-      loansPaid: parseInt(totalPaidResult.rows[0].count) || 0,
-      loansForfeited: parseInt(totalForfeitedResult.rows[0].count) || 0
+      totalPrincipalOut: parseFloat(principalResult.rows[0].sum || 0), // OUTSTANDING (Active/Overdue only)
+      totalActiveLoans: parseInt(activeLoansResult.rows[0].count || 0),
+      totalOverdueLoans: parseInt(overdueLoansResult.rows[0].count || 0),
+      interestCollectedThisMonth: parseFloat(interestThisMonthResult.rows[0].sum || 0),
+      totalCustomers: parseInt(totalCustomersResult.rows[0].count || 0),
+      totalLoans: parseInt(totalLoansResult.rows[0].count || 0),
+      // *** FIX: totalValue now correctly reflects Total Disbursed Principal ***
+      totalValue: totalDisbursedPrincipal, 
+      loansActive: parseInt(activeLoansResult.rows[0].count || 0),
+      loansOverdue: parseInt(overdueLoansResult.rows[0].count || 0),
+      loansPaid: parseInt(totalPaidResult.rows[0].count || 0),
+      loansForfeited: parseInt(totalForfeitedResult.rows[0].count || 0)
     });
   } catch (err) { console.error("Dashboard Stats Error:", err.message); res.status(500).send("Server Error."); }
 });
-
 // --- NEW: FINANCIAL REPORT ENDPOINT (RE-ADDED) ---
 app.get('/api/reports/financial-summary', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
