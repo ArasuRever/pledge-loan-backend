@@ -88,7 +88,7 @@ const calculateTotalMonthsFactor = (startDate, endDate) => {
   let totalMonthsFactor;
 
   if (fullMonthsPassed === 0) { 
-    totalMonthsFactor = 1.0; // Minimum 1 month
+    totalMonthsFactor = 1.0; 
   } else { 
     if (remainingDays > 0) { 
       partialFraction = (remainingDays <= 15) ? 0.5 : 1.0; 
@@ -321,7 +321,10 @@ app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => 
     await client.query('BEGIN');
     const loanResult = await client.query("SELECT principal_amount, status FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
     if (loanResult.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Loan not found." }); }
-    const currentPrincipal = parseFloat(loanResult.rows[0].principal_amount);
+    const currentLoan = loanResult.rows[0];
+    if (currentLoan.status !== 'active' && currentLoan.status !== 'overdue') { await client.query('ROLLBACK'); return res.status(400).json({ error: `Cannot add principal to a loan with status '${currentLoan.status}'.` }); }
+    
+    const currentPrincipal = parseFloat(currentLoan.principal_amount);
     const newPrincipal = currentPrincipal + amountToAdd;
     const updateResult = await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2 RETURNING *", [newPrincipal, loanId]);
     await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4)", [loanId, amountToAdd, 'disbursement', username]);
@@ -332,7 +335,6 @@ app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => 
   } finally { client.release(); }
 });
 
-// --- ⭐ 5. UPDATED LOAN DETAIL ROUTE (WITH SERVER-SIDE BREAKDOWN) ---
 app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
@@ -379,7 +381,7 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
     const initialPrincipal = currentPrincipalTotal - subsequentDisbursementsSum; 
     const disbursements = [];
     
-    // --- BUILD THE BREAKDOWN ON THE SERVER ---
+    // --- BUILD BREAKDOWN ---
     if (initialPrincipal > 0) {
         disbursements.push({ amount: initialPrincipal, date: pledgeDate, isInitial: true });
     }
@@ -393,7 +395,7 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
         totalInterestOwed += interest;
         
         breakdown.push({
-            label: event.isInitial ? 'Initial Principal' : `Top-up #${index}`, // 0 index will be init if exists
+            label: event.isInitial ? 'Initial Principal' : `Top-up #${index}`,
             amount: event.amount,
             date: event.date,
             months: monthsFactor,
@@ -411,7 +413,6 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
     res.json({ 
         loanDetails: loanDetails, 
         transactions: transactions.sort((a, b) => new Date(b.payment_date) - new Date(a.payment_date)),
-        // --- SEND BREAKDOWN TO FRONTENDS ---
         interestBreakdown: breakdown, 
         calculated: {
           totalInterestOwed: totalInterestOwed.toFixed(2),
@@ -459,7 +460,7 @@ app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req
     res.status(201).json({ message: "Loan created successfully", loanId: newLoanId });
   } catch (err) {
     await client.query('ROLLBACK'); console.error("POST Loan Error:", err.message);
-    if (err.code === '23505') return res.status(400).send("Error: Book Loan Number already exists.");
+    if (err.code === '23505') return res.status(400).json({ error: "Book Loan Number already exists." });
     res.status(500).send("Server Error while creating loan");
   } finally { client.release(); }
 });
@@ -499,6 +500,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
       const loanResult = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
       if (loanResult.rows.length === 0) throw new Error('Loan not found.');
       const loan = loanResult.rows[0];
+      if (loan.status === 'deleted') throw new Error('Cannot add transaction to a deleted loan.');
       
       const transactionsResult = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
       const transactions = transactionsResult.rows;
@@ -565,6 +567,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
     return res.status(201).json([newTransaction.rows[0]]);
   } catch (err) {
     await client.query('ROLLBACK'); console.error("POST Transaction Error:", err.message);
+    if (err.code === '23503') return res.status(404).json({ error: 'Loan not found.' });
     res.status(500).send("Server Error");
   } finally { client.release(); }
 });
@@ -621,7 +624,7 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
     if (outstandingAfterSettlement > 2) { 
       await client.query('ROLLBACK');
       return res.status(400).json({
-          error: `Insufficient funds to close. Total Owed: ${totalOwed.toFixed(2)}, Paid Before: ${previouslyPaid.toFixed(2)}, This Payment: ${finalPayment.toFixed(2)}, Discount: ${discount.toFixed(2)}. Remaining: ${outstandingAfterSettlement.toFixed(2)}`
+          error: `Insufficient funds. Total Owed: ${totalOwed.toFixed(2)}, Paid Before: ${previouslyPaid.toFixed(2)}, This Payment: ${finalPayment.toFixed(2)}, Discount: ${discount.toFixed(2)}. Remaining: ${outstandingAfterSettlement.toFixed(2)}`
       });
     }
 
@@ -766,6 +769,8 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
     } catch (err) { console.error(`Error fetching history for loan ${loanId}:`, err.message); res.status(500).send("Server Error fetching loan history."); }
 });
 
+// --- ⭐ 7. UPDATED DASHBOARD STATS (Fixes duplicate variable name) ---
+// --- MODIFIED: Filter out deleted customers and loans from stats ---
 app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
@@ -794,6 +799,71 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
     });
   } catch (err) { console.error("Dashboard Stats Error:", err.message); res.status(500).send("Server Error."); }
 });
+
+// --- NEW: FINANCIAL REPORT ENDPOINT (RE-ADDED) ---
+app.get('/api/reports/financial-summary', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    if (!startDate || !endDate) return res.status(400).json({ error: "Start date and end date are required." });
+
+    // Queries
+    const disbursedQuery = `
+      SELECT SUM(amount_paid) as total 
+      FROM Transactions 
+      WHERE payment_type = 'disbursement' 
+      AND payment_date >= $1 AND payment_date <= $2
+    `;
+
+    const interestQuery = `
+      SELECT SUM(amount_paid) as total 
+      FROM Transactions 
+      WHERE payment_type = 'interest' 
+      AND payment_date >= $1 AND payment_date <= $2
+    `;
+
+    const principalRepaidQuery = `
+      SELECT SUM(amount_paid) as total 
+      FROM Transactions 
+      WHERE (payment_type = 'principal' OR payment_type = 'settlement')
+      AND payment_date >= $1 AND payment_date <= $2
+    `;
+
+    const discountQuery = `
+      SELECT SUM(amount_paid) as total 
+      FROM Transactions 
+      WHERE payment_type = 'discount' 
+      AND payment_date >= $1 AND payment_date <= $2
+    `;
+
+    const [disbursedRes, interestRes, principalRepaidRes, discountRes] = await Promise.all([
+      db.query(disbursedQuery, [startDate, endDate]),
+      db.query(interestQuery, [startDate, endDate]),
+      db.query(principalRepaidQuery, [startDate, endDate]),
+      db.query(discountQuery, [startDate, endDate]),
+    ]);
+
+    const totalDisbursed = parseFloat(disbursedRes.rows[0].total || 0);
+    const totalInterest = parseFloat(interestRes.rows[0].total || 0);
+    const totalPrincipalRepaid = parseFloat(principalRepaidRes.rows[0].total || 0);
+    const totalDiscount = parseFloat(discountRes.rows[0].total || 0);
+    const netProfit = totalInterest - totalDiscount;
+
+    res.json({
+      startDate,
+      endDate,
+      totalDisbursed,
+      totalInterest,
+      totalPrincipalRepaid,
+      totalDiscount,
+      netProfit
+    });
+
+  } catch (err) {
+    console.error("Financial Report Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+// --- END FINANCIAL REPORT ENDPOINT ---
 
 app.get('/api/recycle-bin/deleted', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
