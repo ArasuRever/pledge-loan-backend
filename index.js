@@ -71,32 +71,29 @@ const authorizeAdmin = (req, res, next) => {
   next();
 };
 
-// --- 3. GLOBAL INTEREST CALCULATION FUNCTION (FIXED FOR TIMEZONES) ---
+// --- 3. GLOBAL INTEREST CALCULATION FUNCTION (FIXED) ---
 const calculateTotalMonthsFactor = (startDate, endDate, isInitialPrincipal) => {
-  // 1. Normalize dates to ignore time (Set to Midnight UTC)
   const start = new Date(startDate);
-  start.setUTCHours(0, 0, 0, 0);
-  
   const end = new Date(endDate);
-  end.setUTCHours(0, 0, 0, 0);
 
-  // 2. If end is strictly before start, return 0
-  if (end < start) return 0;
+  // Reset time to midnight to avoid time-of-day issues
+  start.setHours(0,0,0,0);
+  end.setHours(0,0,0,0);
+
+  if (end < start) return 0; // Should not happen if data is correct
 
   let fullMonthsPassed = 0;
   let tempDate = new Date(start);
 
-  // 3. Calculate full months
   while (true) {
       const nextMonth = tempDate.getMonth() + 1;
       tempDate.setMonth(nextMonth);
-      // Handle month rollover (e.g. Jan 31 -> Feb 28)
       if (tempDate.getMonth() !== (nextMonth % 12)) tempDate.setDate(0); 
       
       if (tempDate <= end) { 
         fullMonthsPassed++; 
       } else { 
-        tempDate.setMonth(tempDate.getMonth() - 1); 
+        tempDate.setMonth(tempDate.getMonth() - 1); // Go back
         break; 
       }
   }
@@ -108,14 +105,19 @@ const calculateTotalMonthsFactor = (startDate, endDate, isInitialPrincipal) => {
   let totalMonthsFactor;
 
   if (fullMonthsPassed === 0) { 
-    // 4. Minimum 1 month rule
+    // Minimum 1 month rule (Same as React App)
     totalMonthsFactor = 1.0; 
   } else { 
-    // 5. Partial month logic (>15 days = full month)
+    // Partial month logic (>15 days = full month)
     if (remainingDays > 0) { 
       partialFraction = (remainingDays <= 15) ? 0.5 : 1.0; 
     } 
     totalMonthsFactor = fullMonthsPassed + partialFraction; 
+  }
+
+  // Fallback for weird edge cases where end > start but calc is 0
+  if (totalMonthsFactor === 0 && end >= start) {
+     totalMonthsFactor = 1.0; 
   }
 
   return totalMonthsFactor;
