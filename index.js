@@ -71,24 +71,53 @@ const authorizeAdmin = (req, res, next) => {
   next();
 };
 
-// --- 3. GLOBAL INTEREST CALCULATION FUNCTION (MOVED HERE) ---
+// --- 3. GLOBAL INTEREST CALCULATION FUNCTION (FIXED FOR TIMEZONES) ---
 const calculateTotalMonthsFactor = (startDate, endDate, isInitialPrincipal) => {
-  if (endDate <= startDate) return 0;
+  // 1. Normalize dates to ignore time (Set to Midnight UTC)
+  const start = new Date(startDate);
+  start.setUTCHours(0, 0, 0, 0);
+  
+  const end = new Date(endDate);
+  end.setUTCHours(0, 0, 0, 0);
+
+  // 2. If end is strictly before start, return 0
+  if (end < start) return 0;
+
   let fullMonthsPassed = 0;
-  let tempDate = new Date(startDate);
+  let tempDate = new Date(start);
+
+  // 3. Calculate full months
   while (true) {
       const nextMonth = tempDate.getMonth() + 1;
       tempDate.setMonth(nextMonth);
+      // Handle month rollover (e.g. Jan 31 -> Feb 28)
       if (tempDate.getMonth() !== (nextMonth % 12)) tempDate.setDate(0); 
-      if (tempDate <= endDate) { fullMonthsPassed++; }
-      else { tempDate.setMonth(tempDate.getMonth() - 1); break; }
+      
+      if (tempDate <= end) { 
+        fullMonthsPassed++; 
+      } else { 
+        tempDate.setMonth(tempDate.getMonth() - 1); 
+        break; 
+      }
   }
+
   const oneDay = 1000 * 60 * 60 * 24;
-  const remainingDays = Math.floor((endDate.getTime() - tempDate.getTime()) / oneDay);
-  let partialFraction = 0; let totalMonthsFactor;
-  if (fullMonthsPassed === 0) { totalMonthsFactor = 1.0; }
-  else { if (remainingDays > 0) { partialFraction = (remainingDays <= 15) ? 0.5 : 1.0; } totalMonthsFactor = fullMonthsPassed + partialFraction; }
-  if (totalMonthsFactor === 0 && (endDate.getTime() > startDate.getTime())) { totalMonthsFactor = 0.5; }
+  const remainingDays = Math.floor((end.getTime() - tempDate.getTime()) / oneDay);
+  
+  let partialFraction = 0; 
+  let totalMonthsFactor;
+
+  if (fullMonthsPassed === 0) { 
+    // 4. Minimum 1 month rule
+    totalMonthsFactor = 1.0; 
+  } else { 
+    // 5. Partial month logic (>15 days = full month)
+    if (remainingDays > 0) { 
+      partialFraction = (remainingDays <= 15) ? 0.5 : 1.0; 
+    } 
+    totalMonthsFactor = fullMonthsPassed + partialFraction; 
+  }
+
   return totalMonthsFactor;
 };
 // --- END GLOBAL FUNCTION ---
@@ -440,11 +469,13 @@ app.get('/api/loans/find-by-book-number/:bookNumber', authenticateToken, async (
   }
 });
 
+// --- ⭐ MODIFICATION 1: Log username on new disbursement ---
 app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { additionalAmount } = req.body;
   const loanId = parseInt(id);
   const amountToAdd = parseFloat(additionalAmount);
+  // --- Get username from the token middleware ---
   const username = req.user.username; 
 
   if (isNaN(loanId) || loanId <= 0) return res.status(400).json({ error: "Invalid loan ID." });
@@ -462,6 +493,7 @@ app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => 
     const newPrincipal = currentPrincipal + amountToAdd;
     const updateResult = await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2 RETURNING *", [newPrincipal, loanId]);
     
+    // --- Add username to the INSERT query ---
     await client.query(
       "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4)", 
       [loanId, amountToAdd, 'disbursement', username]
@@ -495,13 +527,14 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
     if (loanResult.rows.length === 0) return res.status(404).json({ error: "Loan not found." });
     let loanDetails = loanResult.rows[0];
 
-    // --- We now fetch the username along with other transaction data ---
+    // --- MODIFIED: Also fetch username from transactions ---
     const transactionsResult = await db.query(
       "SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", 
       [id]
     );
     const transactions = transactionsResult.rows;
 
+    // --- (Calculations remain unchanged) ---
     const currentPrincipalTotal = parseFloat(loanDetails.principal_amount);
     const rate = parseFloat(loanDetails.interest_rate);
     const pledgeDate = new Date(loanDetails.pledge_date);
@@ -540,13 +573,15 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
     });
     const outstandingInterest = totalInterestOwed - interestPaid;
     const amountDue = outstandingPrincipal + outstandingInterest;
+    // --- (End Calculations) ---
 
+    // Handle image data (unchanged)
     if (loanDetails.item_image_data) { const ib64 = loanDetails.item_image_data.toString('base64'); let mt = 'image/jpeg'; if (ib64.startsWith('/9j/')) mt = 'image/jpeg'; else if (ib64.startsWith('iVBORw0KGgo')) mt = 'image/png'; loanDetails.item_image_data_url = `data:${mt};base64,${ib64}`; } delete loanDetails.item_image_data;
     if (loanDetails.customer_image_url) { const cb64 = loanDetails.customer_image_url.toString('base64'); let mt = 'image/jpeg'; if (cb64.startsWith('/9j/')) mt = 'image/jpeg'; else if (cb64.startsWith('iVBORw0KGgo')) mt = 'image/png'; loanDetails.customer_image_url = `data:${mt};base64,${cb64}`; }
 
     res.json({ 
         loanDetails: loanDetails, 
-        // Send transactions DESC for the UI (with username included)
+        // Send transactions DESC for the UI
         transactions: transactions.sort((a, b) => new Date(b.payment_date) - new Date(a.payment_date)),
         calculated: {
           totalInterestOwed: totalInterestOwed.toFixed(2),
@@ -561,8 +596,10 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   } catch (err) { console.error("GET Loan Details Error:", err.message); res.status(500).send("Server Error"); }
 });
 
+// --- ⭐ MODIFICATION 2: Log username on new loan creation (for interest deduction) ---
 app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req, res) => {
   const client = await db.pool.connect();
+  // --- Get username from the token middleware ---
   const username = req.user.username; 
   try {
     const { customer_id, principal_amount, interest_rate, book_loan_number, item_type, description, quality, weight, deductFirstMonthInterest } = req.body;
@@ -591,6 +628,7 @@ app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req
       console.log(`Loan ${newLoanId}: Deducting first month's interest.`);
       const firstMonthInterest = principal * (rate / 100);
       if (firstMonthInterest > 0) {
+        // --- Add username to the INSERT query ---
         const interestTxQuery = `
           INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username)
           VALUES ($1, $2, 'interest', NOW(), $3)
@@ -626,8 +664,10 @@ app.get('/api/customers/:id/loans', authenticateToken, async (req, res) => {
   } catch (err) { console.error("GET Customer Loans Error:", err.message); res.status(500).send("Server Error"); }
 });
 
+// --- ⭐ MODIFICATION 3: Log username on all payment types ---
 app.post('/api/transactions', authenticateToken, async (req, res) => {
   const client = await db.pool.connect();
+  // --- Get username from the token middleware ---
   const username = req.user.username;
   try {
     const { loan_id, amount_paid, payment_type } = req.body; 
@@ -640,17 +680,21 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
 
     await client.query('BEGIN');
 
+    // --- CASE 1: Payment is for Principal (Simple Case) ---
     if (payment_type === 'principal') {
       const newTransaction = await client.query(
+        // --- Add username to the INSERT query ---
         "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", 
         [loanId, paymentAmount, 'principal', username]
       );
       await client.query('COMMIT');
-      return res.status(201).json([newTransaction.rows[0]]);
+      return res.status(201).json([newTransaction.rows[0]]); // Return as array
     }
 
+    // --- CASE 2: Payment is for Interest (Complex Case) ---
     if (payment_type === 'interest') {
       
+      // (Get data and run calculations - unchanged)
       const loanResult = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
       if (loanResult.rows.length === 0) { throw new Error('Loan not found.'); }
       const loan = loanResult.rows[0];
@@ -688,44 +732,52 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
       });
       const outstandingInterest = totalInterestOwed - interestPaid;
 
+      // --- 3. The new splitting logic (with username) ---
       if (paymentAmount > outstandingInterest) {
         const interestPayment = outstandingInterest > 0 ? outstandingInterest : 0; 
         const principalPayment = paymentAmount - interestPayment; 
         let createdTransactions = [];
 
+        // Log the interest part
         if (interestPayment > 0) {
           const interestTx = await client.query(
+            // --- Add username to the INSERT query ---
             "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3) RETURNING *",
             [loanId, interestPayment, username]
           );
           createdTransactions.push(interestTx.rows[0]);
         }
         
+        // Log the leftover principal part
         const principalTx = await client.query(
+          // --- Add username to the INSERT query ---
           "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3) RETURNING *",
           [loanId, principalPayment, username]
         );
         createdTransactions.push(principalTx.rows[0]);
         
         await client.query('COMMIT');
-        return res.status(201).json(createdTransactions);
+        return res.status(201).json(createdTransactions); // Return both
       } else {
+        // Simple case: Payment is less than or equal to interest due
         const newTransaction = await client.query(
+          // --- Add username to the INSERT query ---
           "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3) RETURNING *",
           [loanId, paymentAmount, username]
         );
         await client.query('COMMIT');
-        return res.status(201).json([newTransaction.rows[0]]);
+        return res.status(201).json([newTransaction.rows[0]]); // Return as array
       }
     }
 
     // Fallback for any other payment_type
     const newTransaction = await client.query(
+      // --- Add username to the INSERT query ---
       "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", 
       [loanId, paymentAmount, payment_type, username]
     );
     await client.query('COMMIT');
-    return res.status(201).json([newTransaction.rows[0]]);
+    return res.status(201).json([newTransaction.rows[0]]); // Return as array
 
   } catch (err) {
     await client.query('ROLLBACK');
@@ -1017,6 +1069,7 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const loanId = parseInt(id);
 
+    // --- FIX: Use 400, not 4G00 ---
     if (isNaN(loanId) || loanId <= 0) {
         return res.status(400).json({ error: "Invalid loan ID." });
     }
