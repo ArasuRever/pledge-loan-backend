@@ -859,7 +859,8 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
       db.query("SELECT COUNT(*) FROM Loans WHERE status != 'deleted'"), 
       db.query("SELECT COUNT(*) FROM Loans WHERE status = 'paid'"),
       db.query("SELECT COUNT(*) FROM Loans WHERE status = 'forfeited'"),
-      db.query("SELECT SUM(principal_amount) FROM Loans WHERE status != 'deleted'") 
+      db.query("SELECT SUM(principal_amount) FROM Loans WHERE status != 'deleted'"),
+      db.query("SELECT COUNT(*) FROM Loans WHERE status IN ('paid', 'renewed')"),
     ]);
     
     const totalDisbursedPrincipal = parseFloat(totalDisbursedPrincipalResult.rows[0].sum || 0);
@@ -1084,6 +1085,140 @@ app.get('/api/reports/day-book', authenticateToken, authorizeAdmin, async (req, 
   } catch (err) {
     console.error("Day Book Error:", err.message);
     res.status(500).send("Server Error");
+  }
+});
+
+// - RENEW / ROLLOVER LOAN
+// - SMART RENEWAL (Adds Unpaid Interest to Principal)
+// - CORRECTED RENEWAL ROUTE (Fixes "5 parameters" error)
+app.post('/api/loans/:id/renew', authenticateToken, async (req, res) => {
+  const client = await db.pool.connect();
+  const username = req.user.username;
+  const oldLoanId = parseInt(req.params.id);
+  
+  const { interestPaid, newBookLoanNumber, newInterestRate } = req.body;
+
+  if (isNaN(oldLoanId)) return res.status(400).json({ error: "Invalid Loan ID." });
+  if (!newBookLoanNumber) return res.status(400).json({ error: "New Book Loan Number is required." });
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. Fetch Old Loan & Transactions
+    const oldLoanRes = await client.query(`
+      SELECT l.*, pi.item_type, pi.description, pi.quality, 
+             pi.weight, pi.gross_weight, pi.net_weight, pi.purity, l.appraised_value, pi.item_image_data
+      FROM Loans l 
+      JOIN PledgedItems pi ON l.id = pi.loan_id 
+      WHERE l.id = $1 FOR UPDATE`, [oldLoanId]);
+
+    if (oldLoanRes.rows.length === 0) throw new Error("Loan not found.");
+    const oldLoan = oldLoanRes.rows[0];
+
+    if (oldLoan.status !== 'active' && oldLoan.status !== 'overdue') {
+        throw new Error("Can only renew Active or Overdue loans.");
+    }
+
+    const txRes = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [oldLoanId]);
+    const transactions = txRes.rows;
+
+    // 2. Calculate OUTSTANDING INTEREST
+    const currentPrincipalTotal = parseFloat(oldLoan.principal_amount);
+    const rate = parseFloat(oldLoan.interest_rate);
+    const pledgeDate = new Date(oldLoan.pledge_date);
+    const today = new Date();
+
+    let interestPaidTotal = 0;
+    const disbursementTxs = [];
+
+    transactions.forEach(tx => {
+      const amt = parseFloat(tx.amount_paid);
+      if (tx.payment_type === 'disbursement') disbursementTxs.push({ amount: amt, date: new Date(tx.payment_date) });
+      else if (tx.payment_type === 'interest') interestPaidTotal += amt;
+    });
+
+    const subsequentDisbursementsSum = disbursementTxs.reduce((sum, tx) => sum + tx.amount, 0);
+    const initialPrincipal = currentPrincipalTotal - subsequentDisbursementsSum;
+    
+    const events = [];
+    if (initialPrincipal > 0) events.push({ amount: initialPrincipal, date: pledgeDate });
+    disbursementTxs.forEach(tx => events.push({ amount: tx.amount, date: tx.date }));
+
+    let totalInterestAccrued = 0;
+    events.forEach(e => {
+        const factor = calculateTotalMonthsFactor(e.date, today);
+        totalInterestAccrued += e.amount * (rate / 100) * factor;
+    });
+
+    const outstandingInterest = totalInterestAccrued - interestPaidTotal;
+    
+    // 3. Determine New Principal
+    const payingNow = parseFloat(interestPaid) || 0;
+    const unpaidInterest = outstandingInterest - payingNow;
+    
+    const interestToCapitalize = unpaidInterest > 0 ? unpaidInterest : 0;
+    const newPrincipalAmount = currentPrincipalTotal + interestToCapitalize;
+
+    // 4. Record the Interest Payment (if any)
+    if (payingNow > 0) {
+        await client.query(
+            "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)",
+            [oldLoanId, payingNow, username]
+        );
+    }
+    
+    // 5. Close Old Loan (Mark as 'renewed' instead of 'paid')
+    await client.query("UPDATE Loans SET status = 'renewed', closed_date = NOW() WHERE id = $1", [oldLoanId]);
+
+    // 6. Create NEW Loan
+    const newRate = newInterestRate || oldLoan.interest_rate;
+    const newLoanQuery = `
+      INSERT INTO Loans (customer_id, principal_amount, interest_rate, book_loan_number, appraised_value, pledge_date, due_date) 
+      VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '1 year') 
+      RETURNING id`;
+      
+    const newLoanRes = await client.query(newLoanQuery, [
+        oldLoan.customer_id, 
+        newPrincipalAmount, 
+        newRate, 
+        newBookLoanNumber, 
+        oldLoan.appraised_value || 0
+    ]);
+    const newLoanId = newLoanRes.rows[0].id;
+
+    // 7. Copy Item Details
+    const itemQuery = `
+      INSERT INTO PledgedItems (loan_id, item_type, description, quality, weight, gross_weight, net_weight, purity, item_image_data)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `;
+    await client.query(itemQuery, [
+        newLoanId, oldLoan.item_type, oldLoan.description, oldLoan.quality, 
+        oldLoan.weight, oldLoan.gross_weight, oldLoan.net_weight, oldLoan.purity, oldLoan.item_image_data
+    ]);
+
+    // 8. Audit Log (FIXED: Removed extra parameter)
+    let logMsg = `Renewed from #${oldLoan.book_loan_number}.`;
+    if (interestToCapitalize > 0) logMsg += ` Principal increased by ₹${interestToCapitalize.toFixed(2)} (Unpaid Interest).`;
+    
+    await client.query(
+        "INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username) VALUES ($1, 'renewal', $2, $3, $4)",
+        [newLoanId, logMsg, 'Active', username] // <--- Fixed array (4 items for 4 placeholders)
+    );
+
+    await client.query('COMMIT');
+    
+    res.json({ 
+        message: `Renewed! New Principal: ₹${newPrincipalAmount.toFixed(2)}`, 
+        newLoanId: newLoanId 
+    });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error("Renewal Error:", err.message);
+    if (err.code === '23505') return res.status(400).json({ error: "New Book Loan Number already exists." });
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
