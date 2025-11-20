@@ -142,6 +142,7 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // --- USER MANAGEMENT ---
+// - UPDATED USER MANAGEMENT (Admins & Staff)
 app.get('/api/users', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const users = await db.query("SELECT id, username, role FROM users ORDER BY id ASC");
@@ -149,17 +150,26 @@ app.get('/api/users', authenticateToken, authorizeAdmin, async (req, res) => {
   } catch (err) { res.status(500).send("Server Error"); }
 });
 
-app.post('/api/users/staff', authenticateToken, authorizeAdmin, async (req, res) => {
+// UPDATED: Accepts 'role' in body
+app.post('/api/users/create', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const { username, password, role } = req.body;
     if (!username || !password) return res.status(400).send('Username and password are required.');
+    
+    // Validate/Default role
+    const validRole = (role === 'admin') ? 'admin' : 'staff';
+
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-    const newUser = await db.query("INSERT INTO users (username, password, role) VALUES ($1, $2, 'staff') RETURNING id, username, role", [username, hashedPassword]);
+    
+    const newUser = await db.query(
+        "INSERT INTO users (username, password, role) VALUES ($1, $2, $3) RETURNING id, username, role", 
+        [username, hashedPassword, validRole]
+    );
     res.status(201).json(newUser.rows[0]);
   } catch (err) {
     if (err.code === '23505') return res.status(400).send('Username already exists.');
-    res.status(500).send('Server error during staff creation.');
+    res.status(500).send('Server error during user creation.');
   }
 });
 
@@ -175,15 +185,20 @@ app.put('/api/users/change-password', authenticateToken, authorizeAdmin, async (
   } catch (err) { res.status(500).send('Server error changing password.'); }
 });
 
+// UPDATED: Can delete anyone except SELF
 app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const userId = parseInt(id);
     if (isNaN(userId)) return res.status(400).send('Invalid user ID.');
-    if (userId === req.user.userId) return res.status(400).send('Admin users cannot delete their own account.');
-    const result = await db.query("DELETE FROM users WHERE id = $1 AND role = 'staff' RETURNING id, username", [userId]);
-    if (result.rows.length === 0) return res.status(404).send('Staff user not found.');
-    res.status(200).json({ message: `Staff user ${result.rows[0].username} deleted successfully.` });
+    
+    // Safety Check: Prevent deleting self
+    if (userId === req.user.userId) return res.status(400).send('You cannot delete your own account.');
+    
+    const result = await db.query("DELETE FROM users WHERE id = $1 RETURNING id, username, role", [userId]);
+    if (result.rows.length === 0) return res.status(404).send('User not found.');
+    
+    res.status(200).json({ message: `User ${result.rows[0].username} (${result.rows[0].role}) deleted successfully.` });
   } catch (err) { res.status(500).send('Server error deleting user.'); }
 });
 
