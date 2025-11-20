@@ -328,7 +328,16 @@ app.get('/api/loans/recent/closed', authenticateToken, async (req, res) => {
 app.get('/api/loans/overdue', authenticateToken, async (req, res) => {
   try {
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
-    const query = `SELECT l.id, l.due_date, c.name AS customer_name, l.principal_amount, l.book_loan_number, l.pledge_date FROM Loans l JOIN Customers c ON l.customer_id = c.id WHERE l.status = 'overdue' AND c.is_deleted = false ORDER BY l.due_date ASC`;
+    
+    // FIX: Added 'c.address' to the SELECT list
+    const query = `
+      SELECT l.id, l.due_date, l.principal_amount, l.book_loan_number, l.pledge_date, 
+             c.name AS customer_name, c.phone_number, c.address 
+      FROM Loans l 
+      JOIN Customers c ON l.customer_id = c.id 
+      WHERE l.status = 'overdue' AND c.is_deleted = false 
+      ORDER BY l.due_date ASC`;
+      
     const overdueLoans = await db.query(query);
     res.json(overdueLoans.rows);
   } catch (err) { res.status(500).send("Server Error"); }
