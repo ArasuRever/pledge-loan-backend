@@ -369,7 +369,7 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
              pi.item_type, pi.description, pi.quality, 
              pi.weight, pi.gross_weight, pi.net_weight, pi.purity, 
              pi.item_image_data, 
-             c.name AS customer_name, c.phone_number, c.customer_image_url 
+             c.name AS customer_name, c.phone_number, c.address, c.customer_image_url 
       FROM Loans l 
       LEFT JOIN PledgedItems pi ON l.id = pi.loan_id 
       JOIN Customers c ON l.customer_id = c.id 
