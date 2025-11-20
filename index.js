@@ -1040,6 +1040,53 @@ app.delete('/api/loans/:id/permanent-delete', authenticateToken, authorizeAdmin,
     }
 });
 
+// - NEW DAY BOOK ENDPOINT
+app.get('/api/reports/day-book', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const dateParam = req.query.date; // YYYY-MM-DD
+    if (!dateParam) return res.status(400).json({ error: "Date is required." });
+
+    // 1. Calculate Opening Balance (Sum of ALL transactions BEFORE this date)
+    // Income (IN): interest, principal, settlement, discount (discount reduces owed but doesn't affect cash, wait... discount IS NOT CASH. We must exclude it or handle it carefully. Actually, discount is usually 'virtual', so we EXCLUDE it from cash balance).
+    // Let's refine the query to ONLY count CASH types.
+    
+    const openingBalanceQuery = `
+      SELECT 
+        SUM(CASE WHEN payment_type IN ('interest', 'principal', 'settlement') THEN amount_paid ELSE 0 END) -
+        SUM(CASE WHEN payment_type = 'disbursement' THEN amount_paid ELSE 0 END) as balance
+      FROM Transactions 
+      WHERE payment_date::date < $1::date
+    `;
+    
+    // 2. Fetch Transactions FOR this date
+    const dayTransactionsQuery = `
+      SELECT t.*, l.book_loan_number, c.name as customer_name 
+      FROM Transactions t
+      JOIN Loans l ON t.loan_id = l.id
+      JOIN Customers c ON l.customer_id = c.id
+      WHERE t.payment_date::date = $1::date AND t.payment_type != 'discount'
+      ORDER BY t.payment_date ASC
+    `;
+
+    const [openingRes, dayRes] = await Promise.all([
+      db.query(openingBalanceQuery, [dateParam]),
+      db.query(dayTransactionsQuery, [dateParam])
+    ]);
+
+    const openingBalance = parseFloat(openingRes.rows[0].balance || 0);
+    
+    res.json({
+      date: dateParam,
+      openingBalance: openingBalance,
+      transactions: dayRes.rows
+    });
+
+  } catch (err) {
+    console.error("Day Book Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
 });
