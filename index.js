@@ -897,47 +897,65 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
 });
 
 // --- FINANCIAL REPORT ---
+// - UPDATED FINANCIAL REPORT (Includes Loan Count)
 app.get('/api/reports/financial-summary', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     if (!startDate || !endDate) return res.status(400).json({ error: "Start date and end date are required." });
 
+    // 1. Disbursed (Money OUT) - Includes Principal + Additional Principal
     const disbursedQuery = `
       SELECT SUM(amount_paid) as total 
       FROM Transactions 
       WHERE payment_type = 'disbursement' 
       AND payment_date >= $1 AND payment_date <= $2
     `;
+
+    // 2. Interest (Money IN)
     const interestQuery = `
       SELECT SUM(amount_paid) as total 
       FROM Transactions 
       WHERE payment_type = 'interest' 
       AND payment_date >= $1 AND payment_date <= $2
     `;
+
+    // 3. Principal Repaid (Money IN)
     const principalRepaidQuery = `
       SELECT SUM(amount_paid) as total 
       FROM Transactions 
       WHERE (payment_type = 'principal' OR payment_type = 'settlement')
       AND payment_date >= $1 AND payment_date <= $2
     `;
+
+    // 4. Discount (Virtual Cost)
     const discountQuery = `
       SELECT SUM(amount_paid) as total 
       FROM Transactions 
       WHERE payment_type = 'discount' 
       AND payment_date >= $1 AND payment_date <= $2
     `;
+    
+    // 5. NEW: Count of New Loans Created
+    const loansCountQuery = `
+      SELECT COUNT(*) as count 
+      FROM Loans 
+      WHERE pledge_date >= $1 AND pledge_date <= $2
+    `;
 
-    const [disbursedRes, interestRes, principalRepaidRes, discountRes] = await Promise.all([
+    const [disbursedRes, interestRes, principalRepaidRes, discountRes, loansCountRes] = await Promise.all([
       db.query(disbursedQuery, [startDate, endDate]),
       db.query(interestQuery, [startDate, endDate]),
       db.query(principalRepaidQuery, [startDate, endDate]),
       db.query(discountQuery, [startDate, endDate]),
+      db.query(loansCountQuery, [startDate, endDate]) // --- NEW ---
     ]);
 
     const totalDisbursed = parseFloat(disbursedRes.rows[0].total || 0);
     const totalInterest = parseFloat(interestRes.rows[0].total || 0);
     const totalPrincipalRepaid = parseFloat(principalRepaidRes.rows[0].total || 0);
     const totalDiscount = parseFloat(discountRes.rows[0].total || 0);
+    const loansCreatedCount = parseInt(loansCountRes.rows[0].count || 0); // --- NEW ---
+    
     const netProfit = totalInterest - totalDiscount;
 
     res.json({
@@ -947,7 +965,8 @@ app.get('/api/reports/financial-summary', authenticateToken, authorizeAdmin, asy
       totalInterest,
       totalPrincipalRepaid,
       totalDiscount,
-      netProfit
+      netProfit,
+      loansCreatedCount // --- NEW ---
     });
 
   } catch (err) {
