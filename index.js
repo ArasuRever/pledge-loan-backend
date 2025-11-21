@@ -1085,30 +1085,31 @@ app.delete('/api/loans/:id/permanent-delete', authenticateToken, authorizeAdmin,
 });
 
 // - NEW DAY BOOK ENDPOINT
+// - OPTIMIZED DAY BOOK (Timezone Fixed)
 app.get('/api/reports/day-book', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
-    const dateParam = req.query.date; // YYYY-MM-DD
+    const dateParam = req.query.date; // Client sends 'YYYY-MM-DD'
     if (!dateParam) return res.status(400).json({ error: "Date is required." });
 
-    // 1. Calculate Opening Balance (Sum of ALL transactions BEFORE this date)
-    // Income (IN): interest, principal, settlement, discount (discount reduces owed but doesn't affect cash, wait... discount IS NOT CASH. We must exclude it or handle it carefully. Actually, discount is usually 'virtual', so we EXCLUDE it from cash balance).
-    // Let's refine the query to ONLY count CASH types.
-    
+    // 1. Calculate Opening Balance
+    // Logic: Sum of all transactions strictly BEFORE the start of this day in local time
     const openingBalanceQuery = `
       SELECT 
         SUM(CASE WHEN payment_type IN ('interest', 'principal', 'settlement') THEN amount_paid ELSE 0 END) -
         SUM(CASE WHEN payment_type = 'disbursement' THEN amount_paid ELSE 0 END) as balance
       FROM Transactions 
-      WHERE payment_date::date < $1::date
+      WHERE (payment_date AT TIME ZONE 'Asia/Kolkata')::date < $1::date
     `;
     
     // 2. Fetch Transactions FOR this date
+    // Logic: Transactions that fall ON this specific date in local time
     const dayTransactionsQuery = `
       SELECT t.*, l.book_loan_number, c.name as customer_name 
       FROM Transactions t
       JOIN Loans l ON t.loan_id = l.id
       JOIN Customers c ON l.customer_id = c.id
-      WHERE t.payment_date::date = $1::date AND t.payment_type != 'discount'
+      WHERE (t.payment_date AT TIME ZONE 'Asia/Kolkata')::date = $1::date 
+      AND t.payment_type != 'discount'
       ORDER BY t.payment_date ASC
     `;
 
@@ -1262,6 +1263,57 @@ app.post('/api/loans/:id/renew', authenticateToken, async (req, res) => {
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
+  }
+});
+
+// [cite: index.js] - BUSINESS SETTINGS ROUTES
+
+// GET Settings
+app.get('/api/settings', async (req, res) => {
+  try {
+    const result = await db.query("SELECT * FROM business_settings WHERE id = 1");
+    if (result.rows.length > 0) {
+      const settings = result.rows[0];
+      // If logo is stored as bytea, convert to base64 (if you chose that path),
+      // but for now let's assume it's a text URL or base64 string stored in text column.
+      res.json(settings);
+    } else {
+      res.json({ business_name: 'Sri KuberaLakshmi Bankers' }); // Default fallback
+    }
+  } catch (err) {
+    console.error("Get Settings Error:", err.message);
+    res.status(500).send("Server Error");
+  }
+});
+
+// UPDATE Settings
+app.put('/api/settings', authenticateToken, authorizeAdmin, upload.single('logo'), async (req, res) => {
+  try {
+    const { business_name, address, phone_number, license_number } = req.body;
+    let logoUrl = req.body.existingLogoUrl; // Keep old logo if no new one
+
+    // If a new file is uploaded, convert to Base64 (simple storage for now)
+    if (req.file) {
+      const b64 = req.file.buffer.toString('base64');
+      const mime = req.file.mimetype;
+      logoUrl = `data:${mime};base64,${b64}`;
+    }
+
+    // Upsert logic (Update ID 1)
+    const query = `
+      INSERT INTO business_settings (id, business_name, address, phone_number, license_number, logo_url, updated_at)
+      VALUES (1, $1, $2, $3, $4, $5, NOW())
+      ON CONFLICT (id) DO UPDATE 
+      SET business_name = $1, address = $2, phone_number = $3, license_number = $4, logo_url = $5, updated_at = NOW()
+      RETURNING *
+    `;
+    
+    const result = await db.query(query, [business_name, address, phone_number, license_number, logoUrl]);
+    res.json(result.rows[0]);
+
+  } catch (err) {
+    console.error("Update Settings Error:", err.message);
+    res.status(500).send("Server Error");
   }
 });
 
