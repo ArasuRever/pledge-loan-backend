@@ -726,6 +726,8 @@ app.delete('/api/loans/:id', authenticateToken, authorizeAdmin, async (req, res)
 });
 
 // --- MODIFIED: Update Loan (Includes all new fields in Audit Log) ---
+//
+// --- MODIFIED: Update Loan (Robust Empty String Handling) ---
 app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (req, res) => {
     const { id } = req.params;
     const loanId = parseInt(id);
@@ -740,10 +742,12 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
     const removeItemImage = req.body.removeItemImage === 'true';
 
     if (isNaN(loanId) || loanId <= 0) return res.status(400).json({ error: "Invalid loan ID." });
+    
     const client = await db.pool.connect();
     try {
         await client.query('BEGIN');
-        // Fetch old values including new columns
+        
+        // Fetch old values
         const currentDataQuery = `
             SELECT l.book_loan_number, l.interest_rate, l.pledge_date, l.due_date, l.status, l.appraised_value,
                    pi.id AS item_id, pi.item_type, pi.description, pi.quality, 
@@ -754,67 +758,100 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
             
         const currentResult = await client.query(currentDataQuery, [loanId]);
         if (currentResult.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Loan not found." }); }
+        
         const oldData = currentResult.rows[0];
         const itemId = oldData.item_id;
+        
         if (oldData.status === 'deleted') { await client.query('ROLLBACK'); return res.status(400).json({ error: "Cannot edit a deleted loan." }); }
 
         const historyLogs = [];
         const loanUpdateFields = []; const loanUpdateValues = [];
         const itemUpdateFields = []; const itemUpdateValues = [];
 
+        // --- HELPER TO COMPARE & PREPARE UPDATES ---
         const addUpdate = (table, field, newValue, oldValue, fieldsArray, valuesArray, logLabel = field) => {
-            if (newValue === undefined) return;
-            let oldValCompare, newValCompare;
+            if (newValue === undefined) return; // Field not sent in request
+
+            let dbValue = newValue;
+            
+            // --- FIX: Convert empty strings to NULL for all fields ---
+            if (dbValue === "") dbValue = null;
+
+            let oldValCompare = oldValue;
+            let newValCompare = dbValue;
+
+            // Date comparison logic
             const dateFields = ['pledge_date', 'due_date'];
             if (dateFields.includes(field)) {
-                newValCompare = (newValue === "" || newValue === null) ? null : newValue; 
-                if (oldValue === null || oldValue === undefined) oldValCompare = null;
-                else {
+                if (oldValue) {
                     const d = new Date(oldValue);
                     const year = d.getFullYear();
                     const month = String(d.getMonth() + 1).padStart(2, '0');
                     const day = String(d.getDate()).padStart(2, '0');
                     oldValCompare = `${year}-${month}-${day}`;
+                } else {
+                    oldValCompare = null;
                 }
-            } else {
-                oldValCompare = oldValue; newValCompare = newValue;
-                if (typeof oldValue === 'number' || !isNaN(parseFloat(oldValue))) {
-                    oldValCompare = parseFloat(oldValue); newValCompare = parseFloat(newValue);
-                    if (oldValue === null) oldValCompare = null; if (newValue === null) newValCompare = null;
-                }
+                // Ensure dbValue is strictly null or string for comparison
+                newValCompare = dbValue; 
+            } 
+            // Numeric comparison logic
+            else if (typeof oldValue === 'number' || !isNaN(parseFloat(oldValue))) {
+                // If it's a number column, parse both to compare values, not types
+                if (oldValue !== null) oldValCompare = parseFloat(oldValue);
+                if (dbValue !== null) newValCompare = parseFloat(dbValue);
             }
+
+            // If different, add to update list
             if (newValCompare !== oldValCompare) {
-                let dbValue = newValue;
-                if (dateFields.includes(field) && (newValue === "" || newValue === null)) dbValue = null; 
-                fieldsArray.push(`"${field}"`); valuesArray.push(dbValue);
-                historyLogs.push({ loan_id: loanId, field_changed: logLabel, old_value: String(oldValue ?? 'null'), new_value: String(dbValue ?? 'null'), changed_by_username: username });
+                fieldsArray.push(`"${field}"`);
+                valuesArray.push(dbValue);
+                
+                historyLogs.push({ 
+                    loan_id: loanId, 
+                    field_changed: logLabel, 
+                    old_value: String(oldValue ?? 'null'), 
+                    new_value: String(dbValue ?? 'null'), 
+                    changed_by_username: username 
+                });
             }
         };
 
+        // Check Loan Table Updates
         addUpdate('loans', 'book_loan_number', book_loan_number, oldData.book_loan_number, loanUpdateFields, loanUpdateValues);
         addUpdate('loans', 'interest_rate', interest_rate, oldData.interest_rate, loanUpdateFields, loanUpdateValues);
         addUpdate('loans', 'pledge_date', pledge_date, oldData.pledge_date, loanUpdateFields, loanUpdateValues);
         addUpdate('loans', 'due_date', due_date, oldData.due_date, loanUpdateFields, loanUpdateValues);
-        // New Loan Field
         addUpdate('loans', 'appraised_value', appraised_value, oldData.appraised_value, loanUpdateFields, loanUpdateValues);
 
+        // Check Item Table Updates
         if (itemId) {
             addUpdate('pledgeditems', 'item_type', item_type, oldData.item_type, itemUpdateFields, itemUpdateValues);
             addUpdate('pledgeditems', 'description', description, oldData.description, itemUpdateFields, itemUpdateValues);
             addUpdate('pledgeditems', 'quality', quality, oldData.quality, itemUpdateFields, itemUpdateValues);
-            // New Item Fields & Legacy Weight Sync
+            
+            // Sync legacy 'weight' with 'gross_weight'
             addUpdate('pledgeditems', 'weight', gross_weight, oldData.weight, itemUpdateFields, itemUpdateValues, 'gross_weight (legacy)');
             addUpdate('pledgeditems', 'gross_weight', gross_weight, oldData.gross_weight, itemUpdateFields, itemUpdateValues);
             addUpdate('pledgeditems', 'net_weight', net_weight, oldData.net_weight, itemUpdateFields, itemUpdateValues);
             addUpdate('pledgeditems', 'purity', purity, oldData.purity, itemUpdateFields, itemUpdateValues);
 
+            // Handle Image Update
             if (newItemImageBuffer !== undefined || removeItemImage) {
                 const finalImageValue = removeItemImage ? null : newItemImageBuffer;
                 itemUpdateFields.push(`"item_image_data"`); itemUpdateValues.push(finalImageValue);
-                historyLogs.push({ loan_id: loanId, field_changed: 'item_image', old_value: oldData.item_image_data ? '[Image Data]' : '[No Image]', new_value: finalImageValue ? '[New Image Data]' : '[Image Removed]', changed_by_username: username });
+                
+                historyLogs.push({ 
+                    loan_id: loanId, 
+                    field_changed: 'item_image', 
+                    old_value: oldData.item_image_data ? '[Image Data]' : '[No Image]', 
+                    new_value: finalImageValue ? '[New Image Data]' : '[Image Removed]', 
+                    changed_by_username: username 
+                });
             }
         }
 
+        // Execute Updates
         if (loanUpdateFields.length > 0) {
             const loanSetClause = loanUpdateFields.map((field, i) => `${field} = $${i + 1}`).join(', ');
             loanUpdateValues.push(loanId); 
@@ -827,6 +864,7 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
             await client.query(`UPDATE "pledgeditems" SET ${itemSetClause} WHERE id = $${itemUpdateValues.length}`, itemUpdateValues);
         }
 
+        // Log Changes
         if (historyLogs.length > 0) {
             const historyInsertQuery = `INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username) VALUES ($1, $2, $3, $4, $5)`;
             for (const log of historyLogs) {
@@ -836,11 +874,15 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
 
         await client.query('COMMIT');
         res.json({ message: `Loan ${loanId} updated successfully. ${historyLogs.length} changes logged.` });
+
     } catch (err) {
-        await client.query('ROLLBACK'); console.error(`Error updating loan ${loanId}:`, err.message);
+        await client.query('ROLLBACK'); 
+        console.error(`Error updating loan ${loanId}:`, err.message);
         if (err.code === '23505') return res.status(400).json({ error: "Book Loan Number already exists." });
         res.status(500).send("Server Error while updating loan.");
-    } finally { client.release(); }
+    } finally { 
+        client.release(); 
+    }
 });
 
 app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
@@ -1289,26 +1331,30 @@ app.get('/api/settings', async (req, res) => {
 // UPDATE Settings
 app.put('/api/settings', authenticateToken, authorizeAdmin, upload.single('logo'), async (req, res) => {
   try {
-    const { business_name, address, phone_number, license_number } = req.body;
-    let logoUrl = req.body.existingLogoUrl; // Keep old logo if no new one
+    // 1. Extract the new field 'navbar_display_mode'
+    const { business_name, address, phone_number, license_number, navbar_display_mode } = req.body;
+    let logoUrl = req.body.existingLogoUrl;
 
-    // If a new file is uploaded, convert to Base64 (simple storage for now)
     if (req.file) {
       const b64 = req.file.buffer.toString('base64');
       const mime = req.file.mimetype;
       logoUrl = `data:${mime};base64,${b64}`;
     }
 
-    // Upsert logic (Update ID 1)
+    // 2. Default to 'both' if not provided
+    const displayMode = navbar_display_mode || 'both';
+
+    // 3. Update the Query to include navbar_display_mode
     const query = `
-      INSERT INTO business_settings (id, business_name, address, phone_number, license_number, logo_url, updated_at)
-      VALUES (1, $1, $2, $3, $4, $5, NOW())
+      INSERT INTO business_settings (id, business_name, address, phone_number, license_number, logo_url, navbar_display_mode, updated_at)
+      VALUES (1, $1, $2, $3, $4, $5, $6, NOW())
       ON CONFLICT (id) DO UPDATE 
-      SET business_name = $1, address = $2, phone_number = $3, license_number = $4, logo_url = $5, updated_at = NOW()
+      SET business_name = $1, address = $2, phone_number = $3, license_number = $4, logo_url = $5, navbar_display_mode = $6, updated_at = NOW()
       RETURNING *
     `;
     
-    const result = await db.query(query, [business_name, address, phone_number, license_number, logoUrl]);
+    // 4. Pass the new variable ($6)
+    const result = await db.query(query, [business_name, address, phone_number, license_number, logoUrl, displayMode]);
     res.json(result.rows[0]);
 
   } catch (err) {
