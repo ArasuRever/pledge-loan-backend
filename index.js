@@ -422,7 +422,11 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
       if (tx.payment_type === 'disbursement') {
         disbursementTxs.push({ amount: amount, date: new Date(tx.payment_date) });
       } else {
-        totalPaid += amount;
+        // [FIX] Exclude 'discount' from Total Cash Paid
+        if (tx.payment_type !== 'discount') {
+           totalPaid += amount;
+        }
+
         if (tx.payment_type === 'principal') principalPaid += amount;
         else if (tx.payment_type === 'interest') interestPaid += amount;
       }
