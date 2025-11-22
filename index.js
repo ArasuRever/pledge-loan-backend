@@ -203,11 +203,43 @@ app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res)
 });
 
 // --- CUSTOMERS ---
+//
+// --- CUSTOMERS LIST (With Loan Stats) ---
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
-    const allCustomers = await db.query("SELECT id, name, phone_number, address FROM Customers WHERE is_deleted = false ORDER BY name ASC");
-    res.json(allCustomers.rows);
-  } catch (err) { res.status(500).send("Server Error"); }
+    // We update statuses first to ensure 'overdue' counts are accurate
+    await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
+
+    const query = `
+      SELECT 
+        c.id, c.name, c.phone_number, c.address, c.customer_image_url,
+        COUNT(CASE WHEN l.status = 'active' THEN 1 END)::int AS active_loan_count,
+        COUNT(CASE WHEN l.status = 'overdue' THEN 1 END)::int AS overdue_loan_count,
+        COUNT(CASE WHEN l.status = 'paid' THEN 1 END)::int AS paid_loan_count
+      FROM Customers c
+      LEFT JOIN Loans l ON c.id = l.customer_id AND l.status != 'deleted'
+      WHERE c.is_deleted = false
+      GROUP BY c.id
+      ORDER BY c.name ASC
+    `;
+    
+    const result = await db.query(query);
+    
+    // Process images if needed (optional for list view to save bandwidth, but included here for completeness)
+    const customers = result.rows.map(c => {
+        if (c.customer_image_url) {
+            const b64 = c.customer_image_url.toString('base64');
+            const mime = b64.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
+            c.customer_image_url = `data:${mime};base64,${b64}`;
+        }
+        return c;
+    });
+
+    res.json(customers);
+  } catch (err) { 
+    console.error("Get Customers Error:", err.message);
+    res.status(500).send("Server Error"); 
+  }
 });
 
 app.get('/api/customers/:id', authenticateToken, async (req, res) => {
