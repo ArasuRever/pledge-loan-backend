@@ -668,52 +668,97 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
       await client.query('ROLLBACK'); return res.status(400).json({ error: `Cannot settle a loan with status '${loan.status}'.` });
     }
 
+    // --- 1. Calculate Total Owed & Outstanding Interest ---
     const currentPrincipalTotal = parseFloat(loan.principal_amount);
     const monthlyInterestRatePercent = parseFloat(loan.interest_rate);
     const pledgeDate = new Date(loan.pledge_date);
     const today = new Date();
 
-    const disbursementsResult = await client.query("SELECT amount_paid, payment_date FROM Transactions WHERE loan_id = $1 AND payment_type = 'disbursement' ORDER BY payment_date ASC", [loanId]);
-    const subsequentDisbursementsSum = disbursementsResult.rows.reduce((sum, tx) => sum + parseFloat(tx.amount_paid), 0);
+    const txResult = await client.query("SELECT amount_paid, payment_type, payment_date FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
+    const transactions = txResult.rows;
+
+    // Calculate Disbursements & Interest
+    const disbursements = [];
+    let principalPaidBefore = 0;
+    let interestPaidBefore = 0;
+
+    transactions.forEach(tx => {
+        const amt = parseFloat(tx.amount_paid);
+        if (tx.payment_type === 'disbursement') disbursements.push({ amount: amt, date: new Date(tx.payment_date), isInitial: false });
+        else if (tx.payment_type === 'principal') principalPaidBefore += amt;
+        else if (tx.payment_type === 'interest') interestPaidBefore += amt;
+        // We ignore previous 'settlement' types as this logic replaces them, but if they exist, treat as principal for safety? 
+        // Ideally, legacy 'settlement' should be treated carefully, but for now, we stick to P/I types.
+    });
+
+    // Add initial principal
+    const subsequentDisbursementsSum = disbursements.reduce((sum, d) => sum + d.amount, 0);
     const initialPrincipal = currentPrincipalTotal - subsequentDisbursementsSum;
-    
-    let disbursementEvents = [];
-    if (initialPrincipal > 0) disbursementEvents.push({ amount: initialPrincipal, date: pledgeDate, isInitial: true });
-    disbursementEvents = disbursementEvents.concat(disbursementsResult.rows.map(row => ({ amount: parseFloat(row.amount_paid), date: new Date(row.payment_date), isInitial: false })));
-    
-    let totalInterest = 0;
-    for (const event of disbursementEvents) {
-      if (event.amount <= 0) continue;
-      const monthsFactor = calculateTotalMonthsFactor(event.date, today);
-      totalInterest += event.amount * (monthlyInterestRatePercent / 100) * monthsFactor;
-    }
-    
-    const totalOwed = currentPrincipalTotal + totalInterest;
-    const paidResult = await client.query("SELECT SUM(amount_paid) AS total_paid FROM Transactions WHERE loan_id = $1 AND payment_type != 'disbursement'", [loanId]);
-    const previouslyPaid = parseFloat(paidResult.rows[0].total_paid) || 0;
+    if (initialPrincipal > 0) disbursements.unshift({ amount: initialPrincipal, date: pledgeDate, isInitial: true });
 
-    const outstandingAfterSettlement = totalOwed - previouslyPaid - finalPayment - discount;
+    let totalInterestAccrued = 0;
+    disbursements.forEach(d => {
+        const factor = calculateTotalMonthsFactor(d.date, today);
+        totalInterestAccrued += d.amount * (monthlyInterestRatePercent / 100) * factor;
+    });
 
-    if (outstandingAfterSettlement > 2) { 
+    const totalOwed = currentPrincipalTotal + totalInterestAccrued;
+    const totalPaidBefore = principalPaidBefore + interestPaidBefore; // Excluding previous discounts
+    const outstandingBalance = totalOwed - totalPaidBefore;
+    const outstandingInterest = totalInterestAccrued - interestPaidBefore;
+
+    // --- 2. Validation ---
+    const remainingAfterPayment = outstandingBalance - finalPayment - discount;
+    // Allow tiny floating point diff (e.g., 0.5 rupees)
+    if (remainingAfterPayment > 1.0) { 
       await client.query('ROLLBACK');
       return res.status(400).json({
-          error: `Insufficient funds. Total Owed: ${totalOwed.toFixed(2)}, Paid Before: ${previouslyPaid.toFixed(2)}, This Payment: ${finalPayment.toFixed(2)}, Discount: ${discount.toFixed(2)}. Remaining: ${outstandingAfterSettlement.toFixed(2)}`
+          error: `Insufficient funds. Outstanding: ${outstandingBalance.toFixed(2)}, Payment+Discount: ${(finalPayment + discount).toFixed(2)}. Short by: ${remainingAfterPayment.toFixed(2)}`
       });
     }
 
+    // --- 3. Record Split Transactions ---
     if (finalPayment > 0) {
-       await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'settlement', NOW(), $3)", [loanId, finalPayment, username]);
+        // Split logic: Pay off interest first
+        let interestComponent = 0;
+        let principalComponent = 0;
+
+        if (outstandingInterest > 0) {
+            // If payment covers all interest
+            if (finalPayment >= outstandingInterest) {
+                interestComponent = outstandingInterest;
+                principalComponent = finalPayment - outstandingInterest;
+            } else {
+                // Payment only covers part of interest
+                interestComponent = finalPayment;
+                principalComponent = 0;
+            }
+        } else {
+            // No interest left, all principal
+            principalComponent = finalPayment;
+        }
+
+        if (interestComponent > 0) {
+            await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)", [loanId, interestComponent, username]);
+        }
+        if (principalComponent > 0) {
+            await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3)", [loanId, principalComponent, username]);
+        }
     }
+
     if (discount > 0) {
        await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'discount', NOW(), $3)", [loanId, discount, username]);
     }
 
+    // --- 4. Close Loan ---
     const closeLoan = await client.query("UPDATE Loans SET status = 'paid', closed_date = NOW() WHERE id = $1 RETURNING *", [loanId]);
     await client.query('COMMIT');
     res.json({ message: `Loan successfully closed.`, loan: closeLoan.rows[0] });
 
   } catch (err) {
     await client.query('ROLLBACK'); console.error("Settle Loan Error:", err.message); res.status(500).send("Server Error");
+  } finally {
+    client.release();
   }
 });
 
