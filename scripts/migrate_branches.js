@@ -1,6 +1,9 @@
 const { Pool } = require('pg');
 require('dotenv').config();
 
+// Check if we are connecting to a local database
+const isLocal = process.env.DB_HOST === 'localhost' || process.env.DB_HOST === '127.0.0.1';
+
 // --- CONFIGURATION ---
 const pool = new Pool({
   user: process.env.DB_USER,
@@ -8,12 +11,13 @@ const pool = new Pool({
   database: process.env.DB_DATABASE,
   password: process.env.DB_PASSWORD,
   port: process.env.DB_PORT,
-  ssl: { rejectUnauthorized: false } // Required for Render
+  // Smart SSL: False for Localhost, True for Render
+  ssl: isLocal ? false : { rejectUnauthorized: false }
 });
 
 const runMigration = async () => {
   const client = await pool.connect();
-  console.log('🚀 Starting Branch Migration...');
+  console.log(`🚀 Starting Branch Migration on: ${process.env.DB_HOST}...`);
 
   try {
     await client.query('BEGIN');
@@ -32,8 +36,7 @@ const runMigration = async () => {
       );
     `);
 
-    // 2. Insert Default 'Main Branch' (if not exists)
-    // We use ON CONFLICT to prevent errors if you run this script twice
+    // 2. Insert Default 'Main Branch'
     console.log('Creating Main Branch...');
     const mainBranchRes = await client.query(`
       INSERT INTO branches (branch_name, branch_code, address, phone_number)
@@ -42,7 +45,6 @@ const runMigration = async () => {
       RETURNING id;
     `);
     
-    // If it was an update, we fetch the ID separately
     let mainBranchId = mainBranchRes.rows[0]?.id;
     if (!mainBranchId) {
         const fetchRes = await client.query("SELECT id FROM branches WHERE branch_code = 'MAIN'");
@@ -50,41 +52,20 @@ const runMigration = async () => {
     }
     console.log(`✅ Main Branch ID: ${mainBranchId}`);
 
-    // 3. Add 'branch_id' to USERS table
-    console.log('Updating Users table...');
-    await client.query(`
-      ALTER TABLE users 
-      ADD COLUMN IF NOT EXISTS branch_id INT REFERENCES branches(id);
-    `);
-    await client.query(`UPDATE users SET branch_id = $1 WHERE branch_id IS NULL`, [mainBranchId]);
+    // 3. Add 'branch_id' columns (Safe Updates)
+    const addColumn = async (table) => {
+        console.log(`Updating ${table} table...`);
+        await client.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS branch_id INT REFERENCES branches(id);`);
+        await client.query(`UPDATE ${table} SET branch_id = $1 WHERE branch_id IS NULL`, [mainBranchId]);
+    };
 
-    // 4. Add 'branch_id' to CUSTOMERS table
-    console.log('Updating Customers table...');
-    await client.query(`
-      ALTER TABLE customers 
-      ADD COLUMN IF NOT EXISTS branch_id INT REFERENCES branches(id);
-    `);
-    await client.query(`UPDATE customers SET branch_id = $1 WHERE branch_id IS NULL`, [mainBranchId]);
-
-    // 5. Add 'branch_id' to LOANS table
-    console.log('Updating Loans table...');
-    await client.query(`
-      ALTER TABLE loans 
-      ADD COLUMN IF NOT EXISTS branch_id INT REFERENCES branches(id);
-    `);
-    await client.query(`UPDATE loans SET branch_id = $1 WHERE branch_id IS NULL`, [mainBranchId]);
-
-    // 6. (Optional) Add 'branch_id' to TRANSACTIONS
-    // For now, we rely on the Loan's branch_id, but adding it here helps with specific accounting later.
-    console.log('Updating Transactions table...');
-    await client.query(`
-      ALTER TABLE transactions 
-      ADD COLUMN IF NOT EXISTS branch_id INT REFERENCES branches(id);
-    `);
-    await client.query(`UPDATE transactions SET branch_id = $1 WHERE branch_id IS NULL`, [mainBranchId]);
+    await addColumn('users');
+    await addColumn('customers');
+    await addColumn('loans');
+    await addColumn('transactions');
 
     await client.query('COMMIT');
-    console.log('✅ Migration Successful! All data is now linked to "Main Branch".');
+    console.log('✅ Migration Successful! Local DB is now Multi-Branch ready.');
 
   } catch (err) {
     await client.query('ROLLBACK');
