@@ -1,0 +1,7 @@
+# Dockerfile.seed
+FROM node:18-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+CMD ["node", "scripts/seed_branch.js"]
