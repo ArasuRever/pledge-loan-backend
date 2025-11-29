@@ -234,9 +234,10 @@ app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res)
 });
 
 // --- BRANCH MANAGEMENT ROUTES ---
+// --- BRANCH ROUTE ---
 app.get('/api/branches', authenticateToken, async (req, res) => {
   try {
-    // Only Admin or Staff can see branch list (usually for dropdowns)
+    // Return list of active branches for the dropdown
     const result = await db.query("SELECT id, branch_name, branch_code FROM branches WHERE is_active = true ORDER BY id ASC");
     res.json(result.rows);
   } catch (err) {
