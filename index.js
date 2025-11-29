@@ -127,18 +127,44 @@ app.post('/api/auth/register', authenticateToken, authorizeAdmin, async (req, re
   }
 });
 
+// --- UPDATED LOGIN ROUTE (Phase 2) ---
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).send('Username and password are required.');
+    
+    // FETCH branch_id along with user details
     const userResult = await db.query("SELECT * FROM users WHERE username = $1", [username]);
+    
     if (userResult.rows.length === 0) return res.status(401).send('Invalid credentials.');
     const user = userResult.rows[0];
+    
     const validPassword = await bcrypt.compare(password, user.password); 
     if (!validPassword) return res.status(401).send('Invalid credentials.');
-    const token = jwt.sign({ userId: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token: token, user: { id: user.id, username: user.username, role: user.role } });
-  } catch (err) { res.status(500).send('Server error during login.'); }
+    
+    // INCLUDE branch_id in the token payload
+    const tokenPayload = { 
+      userId: user.id, 
+      username: user.username, 
+      role: user.role,
+      branchId: user.branch_id // <--- NEW FIELD
+    };
+
+    const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '30d' });
+    
+    res.json({ 
+      token: token, 
+      user: { 
+        id: user.id, 
+        username: user.username, 
+        role: user.role,
+        branchId: user.branch_id 
+      } 
+    });
+  } catch (err) { 
+    console.error("Login Error:", err);
+    res.status(500).send('Server error during login.'); 
+  }
 });
 
 // --- USER MANAGEMENT ---
@@ -151,24 +177,29 @@ app.get('/api/users', authenticateToken, authorizeAdmin, async (req, res) => {
 });
 
 // UPDATED: Accepts 'role' in body
+// --- UPDATED CREATE USER ROUTE (Phase 2) ---
 app.post('/api/users/create', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
-    const { username, password, role } = req.body;
+    // added branchId to request body
+    const { username, password, role, branchId } = req.body; 
+    
     if (!username || !password) return res.status(400).send('Username and password are required.');
     
-    // Validate/Default role
+    // Default to admin's branch if not provided, or 1 (Main)
+    const assignedBranch = branchId || req.user.branchId || 1; 
     const validRole = (role === 'admin') ? 'admin' : 'staff';
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
     
     const newUser = await db.query(
-        "INSERT INTO users (username, password, role) VALUES ($1, $2, $3) RETURNING id, username, role", 
-        [username, hashedPassword, validRole]
+        "INSERT INTO users (username, password, role, branch_id) VALUES ($1, $2, $3, $4) RETURNING id, username, role, branch_id", 
+        [username, hashedPassword, validRole, assignedBranch]
     );
     res.status(201).json(newUser.rows[0]);
   } catch (err) {
     if (err.code === '23505') return res.status(400).send('Username already exists.');
+    console.error("Create User Error:", err);
     res.status(500).send('Server error during user creation.');
   }
 });
@@ -329,18 +360,53 @@ app.delete('/api/customers/:id', authenticateToken, authorizeAdmin, async (req, 
 });
 
 // --- LOANS ---
+// --- UPDATED GET LOANS (Phase 2 - Branch Filtered) ---
 app.get('/api/loans', authenticateToken, async (req, res) => {
   try {
-    await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
-    const query = `
-      SELECT l.id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date, l.status,
-             c.name AS customer_name, c.phone_number
-      FROM Loans l JOIN Customers c ON l.customer_id = c.id
-      WHERE l.status IN ('active', 'overdue', 'paid', 'forfeited') AND c.is_deleted = false
-      ORDER BY l.pledge_date DESC`; 
-    const allLoans = await db.query(query);
+    // 1. Update Overdue Status (Standard maintenance)
+    // We restrict this update to the user's branch permissions to be safe, 
+    // but updating all is fine for Admins.
+    if (req.user.role === 'admin') {
+       await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
+    } else {
+       await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active' AND branch_id = $1", [req.user.branchId]);
+    }
+
+    let query;
+    let params = [];
+
+    // 2. Build Query based on Role
+    if (req.user.role === 'admin') {
+      // ADMIN: Sees ALL loans (Active, Overdue, Paid, Forfeited)
+      query = `
+        SELECT l.id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date, l.status,
+               c.name AS customer_name, c.phone_number, b.branch_name
+        FROM Loans l 
+        JOIN Customers c ON l.customer_id = c.id
+        LEFT JOIN Branches b ON l.branch_id = b.id
+        WHERE l.status IN ('active', 'overdue', 'paid', 'forfeited') AND c.is_deleted = false
+        ORDER BY l.pledge_date DESC`;
+    } else {
+      // STAFF: Sees ONLY their branch's loans
+      query = `
+        SELECT l.id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date, l.status,
+               c.name AS customer_name, c.phone_number, b.branch_name
+        FROM Loans l 
+        JOIN Customers c ON l.customer_id = c.id
+        LEFT JOIN Branches b ON l.branch_id = b.id
+        WHERE l.status IN ('active', 'overdue', 'paid', 'forfeited') 
+          AND c.is_deleted = false 
+          AND l.branch_id = $1
+        ORDER BY l.pledge_date DESC`;
+      params.push(req.user.branchId);
+    }
+
+    const allLoans = await db.query(query, params);
     res.json(allLoans.rows);
-  } catch (err) { res.status(500).send("Server Error"); }
+  } catch (err) { 
+    console.error("Get Loans Error:", err);
+    res.status(500).send("Server Error"); 
+  }
 });
 
 app.get('/api/loans/recent/created', authenticateToken, async (req, res) => {
@@ -537,8 +603,11 @@ app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req
 
     await client.query('BEGIN');
     // 1. Insert Loan (added appraised_value)
-    const loanQuery = `INSERT INTO Loans (customer_id, principal_amount, interest_rate, book_loan_number, appraised_value) VALUES ($1, $2, $3, $4, $5) RETURNING id`;
-    const loanResult = await client.query(loanQuery, [customer_id, principal, rate, book_loan_number, appraised_value || 0]);
+    // NEW (Includes branch_id)
+    // Use the user's branch from the token
+    const branchId = req.user.branchId || 1; 
+    const loanQuery = `INSERT INTO Loans (customer_id, principal_amount, interest_rate, book_loan_number, appraised_value, branch_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`;
+    const loanResult = await client.query(loanQuery, [customer_id, principal, rate, book_loan_number, appraised_value || 0, branchId]);
     const newLoanId = loanResult.rows[0].id;
 
     // 2. Insert Pledged Item (added gross_weight, net_weight, purity)
