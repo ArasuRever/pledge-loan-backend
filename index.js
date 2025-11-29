@@ -233,6 +233,18 @@ app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res)
   } catch (err) { res.status(500).send('Server error deleting user.'); }
 });
 
+// --- BRANCH MANAGEMENT ROUTES ---
+app.get('/api/branches', authenticateToken, async (req, res) => {
+  try {
+    // Only Admin or Staff can see branch list (usually for dropdowns)
+    const result = await db.query("SELECT id, branch_name, branch_code FROM branches WHERE is_active = true ORDER BY id ASC");
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Get Branches Error:", err);
+    res.status(500).send("Server Error");
+  }
+});
+
 // --- CUSTOMERS ---
 //
 // --- CUSTOMERS LIST (With Loan Stats) ---
