@@ -233,18 +233,6 @@ app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res)
   } catch (err) { res.status(500).send('Server error deleting user.'); }
 });
 
-// --- BRANCH MANAGEMENT ROUTES ---
-// --- BRANCH ROUTE ---
-app.get('/api/branches', authenticateToken, async (req, res) => {
-  try {
-    // Return list of active branches for the dropdown
-    const result = await db.query("SELECT id, branch_name, branch_code FROM branches WHERE is_active = true ORDER BY id ASC");
-    res.json(result.rows);
-  } catch (err) {
-    console.error("Get Branches Error:", err);
-    res.status(500).send("Server Error");
-  }
-});
 
 // --- CUSTOMERS ---
 //
@@ -1117,9 +1105,30 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
     } catch (err) { console.error(`Error fetching history for loan ${loanId}:`, err.message); res.status(500).send("Server Error fetching loan history."); }
 });
 
+
+// --- BRANCH MANAGEMENT ROUTE ---
+app.get('/api/branches', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query("SELECT id, branch_name, branch_code FROM branches WHERE is_active = true ORDER BY id ASC");
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Get Branches Error:", err);
+    res.status(500).send("Server Error");
+  }
+});
+
 // --- DASHBOARD STATS ---
+// --- UPDATED DASHBOARD STATS (Supports Branch Filtering) ---
 app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
+    const { branchId } = req.query; // Check if frontend sent a specific branch
+    const bId = branchId ? parseInt(branchId) : null;
+
+    // Helper to build queries: If bId exists, filter by it. If null, show all.
+    // Logic: "WHERE ($1::int IS NULL OR branch_id = $1)"
+    const whereBranch = " AND ($1::int IS NULL OR branch_id = $1)";
+    const params = [bId];
+
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
 
     const [
@@ -1133,16 +1142,17 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
       totalForfeitedResult,
       totalDisbursedPrincipalResult 
     ] = await Promise.all([
-      db.query("SELECT SUM(principal_amount) FROM Loans WHERE status = 'active' OR status = 'overdue'"), 
-      db.query("SELECT COUNT(*) FROM Loans WHERE status = 'active' OR status = 'overdue'"),
-      db.query("SELECT COUNT(*) FROM Loans WHERE status = 'overdue'"),
-      db.query("SELECT SUM(amount_paid) FROM Transactions WHERE payment_type = 'interest' AND payment_date >= date_trunc('month', CURRENT_DATE)"),
-      db.query("SELECT COUNT(*) FROM Customers WHERE is_deleted = false"),
-      db.query("SELECT COUNT(*) FROM Loans WHERE status != 'deleted'"), 
-      db.query("SELECT COUNT(*) FROM Loans WHERE status = 'paid'"),
-      db.query("SELECT COUNT(*) FROM Loans WHERE status = 'forfeited'"),
-      db.query("SELECT SUM(principal_amount) FROM Loans WHERE status != 'deleted'"),
-      db.query("SELECT COUNT(*) FROM Loans WHERE status IN ('paid', 'renewed')"),
+      db.query(`SELECT SUM(principal_amount) FROM Loans WHERE (status = 'active' OR status = 'overdue') ${whereBranch}`, params), 
+      db.query(`SELECT COUNT(*) FROM Loans WHERE (status = 'active' OR status = 'overdue') ${whereBranch}`, params),
+      db.query(`SELECT COUNT(*) FROM Loans WHERE status = 'overdue' ${whereBranch}`, params),
+      // For Transactions, we join Loans to check the branch
+      db.query(`SELECT SUM(t.amount_paid) FROM Transactions t JOIN Loans l ON t.loan_id = l.id WHERE t.payment_type = 'interest' AND t.payment_date >= date_trunc('month', CURRENT_DATE) ${whereBranch}`, params),
+      db.query(`SELECT COUNT(*) FROM Customers WHERE is_deleted = false ${whereBranch}`, params),
+      db.query(`SELECT COUNT(*) FROM Loans WHERE status != 'deleted' ${whereBranch}`, params), 
+      db.query(`SELECT COUNT(*) FROM Loans WHERE status = 'paid' ${whereBranch}`, params),
+      db.query(`SELECT COUNT(*) FROM Loans WHERE status = 'forfeited' ${whereBranch}`, params),
+      db.query(`SELECT SUM(principal_amount) FROM Loans WHERE status != 'deleted' ${whereBranch}`, params),
+      db.query(`SELECT COUNT(*) FROM Loans WHERE status IN ('paid', 'renewed') ${whereBranch}`, params),
     ]);
     
     const totalDisbursedPrincipal = parseFloat(totalDisbursedPrincipalResult.rows[0].sum || 0);
@@ -1160,7 +1170,10 @@ app.get('/api/dashboard/stats', authenticateToken, authorizeAdmin, async (req, r
       loansPaid: parseInt(totalPaidResult.rows[0].count || 0),
       loansForfeited: parseInt(totalForfeitedResult.rows[0].count || 0)
     });
-  } catch (err) { console.error("Dashboard Stats Error:", err.message); res.status(500).send("Server Error."); }
+  } catch (err) { 
+    console.error("Dashboard Stats Error:", err); 
+    res.status(500).send("Server Error."); 
+  }
 });
 
 // --- FINANCIAL REPORT ---
