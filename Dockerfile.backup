@@ -1,0 +1,17 @@
+# Dockerfile.backup
+FROM node:18-alpine
+
+# Install PostgreSQL client tools (contains pg_dump)
+RUN apk add --no-cache postgresql-client
+
+WORKDIR /app
+
+# Copy package files and install dependencies
+COPY package*.json ./
+RUN npm install
+
+# Copy the rest of the backend code
+COPY . .
+
+# Run the backup script
+CMD ["node", "scripts/backup.js"]
