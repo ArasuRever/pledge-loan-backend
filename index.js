@@ -236,27 +236,59 @@ app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res)
 // --- CUSTOMERS ---
 //
 // --- CUSTOMERS LIST (With Loan Stats) ---
+// --- UPDATED GET CUSTOMERS (Phase 2 - Branch Filtered) ---
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
-    // We update statuses first to ensure 'overdue' counts are accurate
-    await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
+    // 1. Update Overdue Status (Standard maintenance)
+    // Same logic as loans: Admins update all, Staff update theirs (to be safe)
+    if (req.user.role === 'admin') {
+       await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
+    } else {
+       await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active' AND branch_id = $1", [req.user.branchId]);
+    }
 
-    const query = `
-      SELECT 
-        c.id, c.name, c.phone_number, c.address, c.customer_image_url,
-        COUNT(CASE WHEN l.status = 'active' THEN 1 END)::int AS active_loan_count,
-        COUNT(CASE WHEN l.status = 'overdue' THEN 1 END)::int AS overdue_loan_count,
-        COUNT(CASE WHEN l.status = 'paid' THEN 1 END)::int AS paid_loan_count
-      FROM Customers c
-      LEFT JOIN Loans l ON c.id = l.customer_id AND l.status != 'deleted'
-      WHERE c.is_deleted = false
-      GROUP BY c.id
-      ORDER BY c.name ASC
-    `;
+    let query;
+    let params = [];
+
+    // 2. Build Query based on Role
+    // Note: We join with Branches table to get the branch name (optional but useful)
+    if (req.user.role === 'admin') {
+      // ADMIN: Sees ALL customers
+      query = `
+        SELECT 
+          c.id, c.name, c.phone_number, c.address, c.customer_image_url, c.branch_id, b.branch_name,
+          COUNT(CASE WHEN l.status = 'active' THEN 1 END)::int AS active_loan_count,
+          COUNT(CASE WHEN l.status = 'overdue' THEN 1 END)::int AS overdue_loan_count,
+          COUNT(CASE WHEN l.status = 'paid' THEN 1 END)::int AS paid_loan_count
+        FROM Customers c
+        LEFT JOIN Loans l ON c.id = l.customer_id AND l.status != 'deleted'
+        LEFT JOIN Branches b ON c.branch_id = b.id
+        WHERE c.is_deleted = false
+        GROUP BY c.id, b.branch_name
+        ORDER BY c.name ASC
+      `;
+    } else {
+      // STAFF: Sees ONLY their branch's customers
+      query = `
+        SELECT 
+          c.id, c.name, c.phone_number, c.address, c.customer_image_url, c.branch_id, b.branch_name,
+          COUNT(CASE WHEN l.status = 'active' THEN 1 END)::int AS active_loan_count,
+          COUNT(CASE WHEN l.status = 'overdue' THEN 1 END)::int AS overdue_loan_count,
+          COUNT(CASE WHEN l.status = 'paid' THEN 1 END)::int AS paid_loan_count
+        FROM Customers c
+        LEFT JOIN Loans l ON c.id = l.customer_id AND l.status != 'deleted'
+        LEFT JOIN Branches b ON c.branch_id = b.id
+        WHERE c.is_deleted = false 
+        AND c.branch_id = $1
+        GROUP BY c.id, b.branch_name
+        ORDER BY c.name ASC
+      `;
+      params.push(req.user.branchId);
+    }
     
-    const result = await db.query(query);
+    const result = await db.query(query, params);
     
-    // Process images if needed (optional for list view to save bandwidth, but included here for completeness)
+    // Process images
     const customers = result.rows.map(c => {
         if (c.customer_image_url) {
             const b64 = c.customer_image_url.toString('base64');
@@ -268,7 +300,7 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
 
     res.json(customers);
   } catch (err) { 
-    console.error("Get Customers Error:", err.message);
+    console.error("Get Customers Error:", err);
     res.status(500).send("Server Error"); 
   }
 });
@@ -290,22 +322,29 @@ app.get('/api/customers/:id', authenticateToken, async (req, res) => {
 });
 
 // --- MODIFIED: Create Customer (Includes KYC & Nominee) ---
+// --- UPDATED CREATE CUSTOMER (Phase 2 - Auto Branch Tag) ---
 app.post('/api/customers', authenticateToken, upload.single('photo'), async (req, res) => {
   try {
     const { name, phone_number, address, id_proof_type, id_proof_number, nominee_name, nominee_relation } = req.body;
     const imageBuffer = req.file ? req.file.buffer : null;
+    
     if (!name || !phone_number) return res.status(400).json({ error: 'Name and phone are required.' });
     
+    // 1. Determine Branch
+    // If admin provides a 'branchId' in body, use it. Otherwise default to user's branch.
+    // (Parsing int to ensure safety)
+    const assignedBranch = req.body.branchId ? parseInt(req.body.branchId) : (req.user.branchId || 1);
+
     const newCustomerResult = await db.query(
       `INSERT INTO Customers 
-       (name, phone_number, address, id_proof_type, id_proof_number, nominee_name, nominee_relation, customer_image_url, is_deleted) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false) 
+       (name, phone_number, address, id_proof_type, id_proof_number, nominee_name, nominee_relation, customer_image_url, is_deleted, branch_id) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9) 
        RETURNING *`,
-      [name, phone_number, address, id_proof_type, id_proof_number, nominee_name, nominee_relation, imageBuffer]
+      [name, phone_number, address, id_proof_type, id_proof_number, nominee_name, nominee_relation, imageBuffer, assignedBranch]
     );
     res.status(201).json(newCustomerResult.rows[0]);
   } catch (err) { 
-    console.error("Create Customer Error:", err.message);
+    console.error("Create Customer Error:", err);
     res.status(500).send("Server Error"); 
   }
 });
@@ -315,6 +354,17 @@ app.put('/api/customers/:id', authenticateToken, upload.single('photo'), async (
     try {
         const id = parseInt(req.params.id);
         if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
+
+        // --- 🛡️ PASTE THE SECURITY SNIPPET HERE ---
+        // Check if the user is authorized to edit this specific customer
+        if (req.user.role !== 'admin') {
+            const checkBranch = await db.query("SELECT branch_id FROM Customers WHERE id = $1", [id]);
+            // If customer exists AND belongs to a different branch -> Block access
+            if (checkBranch.rows.length > 0 && checkBranch.rows[0].branch_id !== req.user.branchId) {
+                return res.status(403).json({ error: "Access Denied. You can only edit customers in your branch." });
+            }
+        }
+        // ---------------------------------------------
         
         const { name, phone_number, address, id_proof_type, id_proof_number, nominee_name, nominee_relation } = req.body;
         let imageBuffer = null;
@@ -343,7 +393,10 @@ app.put('/api/customers/:id', authenticateToken, upload.single('photo'), async (
         const updateCustomerResult = await db.query(query, values);
         if (updateCustomerResult.rows.length === 0) return res.status(404).json({ error: "Customer not found." });
         res.json(updateCustomerResult.rows[0]);
-    } catch (err) { res.status(500).send("Server Error"); }
+    } catch (err) { 
+        console.error("Update Customer Error:", err);
+        res.status(500).send("Server Error"); 
+    }
 });
 
 app.delete('/api/customers/:id', authenticateToken, authorizeAdmin, async (req, res) => {
