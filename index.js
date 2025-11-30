@@ -1486,6 +1486,59 @@ app.put('/api/settings', authenticateToken, authorizeAdmin, upload.single('logo'
   }
 });
 
+// --- SMART SEARCH ROUTE (Loans, Phones, Names) ---
+// --- LIVE SEARCH SUGGESTIONS ROUTE ---
+app.get('/api/search', authenticateToken, async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q || q.trim() === '') return res.json([]);
+
+    const cleanQuery = q.trim();
+    const likeQuery = `%${cleanQuery}%`; // Allows partial matching
+
+    // 1. Search Loans (Book Number) - Limit 3
+    const loanRes = await db.query(
+      "SELECT id, book_loan_number, principal_amount FROM Loans WHERE book_loan_number ILIKE $1 AND status != 'deleted' LIMIT 3", 
+      [likeQuery]
+    );
+
+    // 2. Search Customers (Name or Phone) - Limit 5
+    const custRes = await db.query(
+      "SELECT id, name, phone_number FROM Customers WHERE (name ILIKE $1 OR phone_number ILIKE $1) AND is_deleted = false LIMIT 5", 
+      [likeQuery]
+    );
+
+    // 3. Combine & Format Results
+    const results = [];
+
+    // Add Loans
+    loanRes.rows.forEach(loan => {
+      results.push({
+        type: 'loan',
+        id: loan.id,
+        title: `Loan #${loan.book_loan_number}`,
+        subtitle: `₹${loan.principal_amount}`
+      });
+    });
+
+    // Add Customers
+    custRes.rows.forEach(cust => {
+      results.push({
+        type: 'customer',
+        id: cust.id,
+        title: cust.name,
+        subtitle: cust.phone_number
+      });
+    });
+
+    res.json(results);
+
+  } catch (err) {
+    console.error("Search Error:", err);
+    res.status(500).send("Server Error");
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
 });
