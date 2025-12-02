@@ -1206,18 +1206,34 @@ app.post('/api/branches', authenticateToken, authorizeAdmin, async (req, res) =>
 app.put('/api/branches/:id', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { branch_name, branch_code, address, phone_number, is_active } = req.body;
+    // ADD license_number to extraction
+    const { branch_name, branch_code, address, phone_number, license_number, is_active } = req.body;
+
+    // We must fetch existing data first if some fields are missing (Partial Update logic)
+    // allowing the frontend to send only address/phone if it wants.
+    const existing = await db.query("SELECT * FROM branches WHERE id = $1", [id]);
+    if (existing.rows.length === 0) return res.status(404).send("Branch not found.");
+    
+    const old = existing.rows[0];
+    
+    // Fallback to existing values if new ones are undefined
+    const newName = branch_name || old.branch_name;
+    const newCode = branch_code || old.branch_code;
+    const newAddr = address || old.address;
+    const newPhone = phone_number || old.phone_number;
+    const newLicense = license_number || old.license_number;
+    const newActive = (is_active !== undefined) ? is_active : old.is_active;
 
     const result = await db.query(
       `UPDATE branches 
-       SET branch_name = $1, branch_code = $2, address = $3, phone_number = $4, is_active = $5 
-       WHERE id = $6 RETURNING *`,
-      [branch_name, branch_code, address, phone_number, is_active, id]
+       SET branch_name = $1, branch_code = $2, address = $3, phone_number = $4, license_number = $5, is_active = $6 
+       WHERE id = $7 RETURNING *`,
+      [newName, newCode, newAddr, newPhone, newLicense, newActive, id]
     );
     
-    if (result.rows.length === 0) return res.status(404).send("Branch not found.");
     res.json(result.rows[0]);
   } catch (err) {
+    console.error("Update Branch Error:", err); // Added logging
     res.status(500).send("Server Error");
   }
 });
