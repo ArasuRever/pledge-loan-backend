@@ -226,6 +226,36 @@ app.post('/api/users/create', authenticateToken, authorizeAdmin, async (req, res
   }
 });
 
+// Update User Details (Role, Branch, Username)
+app.put('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { username, role, branchId } = req.body;
+    
+    // 1. Check if user exists
+    const check = await db.query("SELECT * FROM users WHERE id = $1", [id]);
+    if (check.rows.length === 0) return res.status(404).json({ error: "User not found" });
+
+    // 2. Prepare Update
+    // Use existing values if not provided
+    const oldUser = check.rows[0];
+    const newUsername = username || oldUser.username;
+    const newRole = role || oldUser.role;
+    const newBranchId = (branchId !== undefined) ? branchId : oldUser.branch_id;
+
+    // 3. Update Query
+    const result = await db.query(
+      "UPDATE users SET username = $1, role = $2, branch_id = $3 WHERE id = $4 RETURNING id, username, role, branch_id",
+      [newUsername, newRole, newBranchId, id]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Update User Error:", err);
+    res.status(500).send("Server Error");
+  }
+});
+
 app.put('/api/users/change-password', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const { userId, newPassword } = req.body;
@@ -1156,14 +1186,17 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
 
 // --- BRANCH MANAGEMENT ROUTES (Admin/Manager) ---
 // 1. GET ALL Branches
+// 1. GET ALL Branches
 app.get('/api/branches', authenticateToken, authorizeManagement, async (req, res) => {
   try {
     if (req.user.role === 'admin') {
-        const result = await db.query("SELECT id, branch_name, branch_code FROM branches WHERE is_active = true ORDER BY id ASC");
+        // FIX: Changed to SELECT * to get 'is_active', 'address', etc.
+        // FIX: Removed 'WHERE is_active = true' so Admins can see Inactive branches too.
+        const result = await db.query("SELECT * FROM branches ORDER BY id ASC");
         res.json(result.rows);
     } else {
-        // Manager sees only their own branch
-        const result = await db.query("SELECT id, branch_name, branch_code FROM branches WHERE id = $1", [req.user.branchId]);
+        // Manager sees only their own branch (also getting all details now)
+        const result = await db.query("SELECT * FROM branches WHERE id = $1", [req.user.branchId]);
         res.json(result.rows);
     }
   } catch (err) {
