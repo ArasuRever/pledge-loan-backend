@@ -1277,7 +1277,13 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
   try {
     const targetBranch = getTargetBranchId(req); // Null (Admin All) or ID
 
-    // Build params for query injection
+    // 1. Update Overdue Status
+    let updateQuery = "UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'";
+    // Use specific branch filter if applicable to optimize
+    if (targetBranch) updateQuery += ` AND branch_id = ${targetBranch}`; 
+    await db.query(updateQuery);
+
+    // 2. Build Base Filter for Counts
     let whereClause = " WHERE 1=1 "; 
     const params = [];
 
@@ -1285,13 +1291,8 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
         whereClause += ` AND branch_id = $1`;
         params.push(targetBranch);
     }
-    
-    // 1. Update Overdue
-    let updateQuery = "UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'";
-    if (targetBranch) updateQuery += ` AND branch_id = ${targetBranch}`; 
-    await db.query(updateQuery);
 
-    // 2. Basic Counts & Principal Out
+    // 3. Fetch Basic Aggregates (Parallel)
     const [
       principalRes, activeRes, overdueRes, customersRes, loansRes, paidRes, forfeitedRes, disbursedRes
     ] = await Promise.all([
@@ -1305,10 +1306,10 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
       db.query(`SELECT SUM(principal_amount) FROM Loans ${whereClause} AND status != 'deleted'`, params)
     ]);
     
-    // 3. Calculate Total Interest Accrued
+    // 4. Calculate Total Interest Accrued (Complex Logic)
     let totalInterestAccrued = 0;
     
-    // Fetch all Active/Overdue loans for calculation
+    // Fetch active loans to calculate their specific interest
     const loansQuery = `SELECT id, principal_amount, interest_rate, pledge_date FROM Loans ${whereClause} AND (status = 'active' OR status = 'overdue')`;
     const loansResult = await db.query(loansQuery, params);
     const activeLoans = loansResult.rows;
@@ -1316,16 +1317,15 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
     if (activeLoans.length > 0) {
         const loanIds = activeLoans.map(l => l.id);
         
-        const nextParamIndex = params.length + 1;
-        const txQuery = `SELECT loan_id, amount_paid, payment_type, payment_date FROM Transactions WHERE loan_id = ANY($${nextParamIndex}::int[])`;
-        
-        // --- FIX IS HERE: Corrected variable name to 'txResult' ---
-        const txResult = await db.query(txQuery, [...params, loanIds]);
+        // FIX: Simplified Query. We don't rely on 'params' here.
+        // We just pass loanIds as the first and only argument ($1)
+        const txQuery = `SELECT loan_id, amount_paid, payment_type, payment_date FROM Transactions WHERE loan_id = ANY($1::int[])`;
+        const txResult = await db.query(txQuery, [loanIds]);
         const allTxs = txResult.rows; 
 
         const today = new Date();
 
-        // Calculation Loop
+        // Iterate and Calculate
         for (const loan of activeLoans) {
             const loanTxs = allTxs.filter(t => t.loan_id === loan.id);
             
@@ -1336,6 +1336,7 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
             const disbursementTxs = loanTxs.filter(t => t.payment_type === 'disbursement');
             const interestPaid = loanTxs.filter(t => t.payment_type === 'interest').reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
 
+            // Reconstruct timeline
             const disbursementsSum = disbursementTxs.reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
             const initialPrincipal = currentPrincipal - disbursementsSum;
             
@@ -1350,6 +1351,7 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
             }
 
             const accrued = totalInterestGenerated - interestPaid;
+            // Only add positive accrued amount (if they overpaid interest, we don't subtract it from total)
             if (accrued > 0) totalInterestAccrued += accrued;
         }
     }
