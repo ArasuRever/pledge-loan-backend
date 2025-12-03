@@ -1,3 +1,4 @@
+
 const express = require('express');
 const db = require('./db');
 const cors = require('cors');
@@ -1277,7 +1278,6 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
     const targetBranch = getTargetBranchId(req); // Null (Admin All) or ID
 
     // Build params for query injection
-    // Trick: If targetBranch is NULL, we ignore the check via application logic construction
     let whereClause = " WHERE 1=1 "; 
     const params = [];
 
@@ -1288,13 +1288,10 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
     
     // 1. Update Overdue
     let updateQuery = "UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'";
-    if (targetBranch) updateQuery += ` AND branch_id = ${targetBranch}`; // Simple interpolation for update as ID is int
+    if (targetBranch) updateQuery += ` AND branch_id = ${targetBranch}`; 
     await db.query(updateQuery);
 
-    // 2. Parallel Queries
-    // Note: Loans table has branch_id. Customers table has branch_id.
-    // Interest query needs a Join.
-
+    // 2. Basic Counts & Principal Out
     const [
       principalRes, activeRes, overdueRes, customersRes, loansRes, paidRes, forfeitedRes, disbursedRes
     ] = await Promise.all([
@@ -1308,24 +1305,60 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
       db.query(`SELECT SUM(principal_amount) FROM Loans ${whereClause} AND status != 'deleted'`, params)
     ]);
     
-    // Interest Query (Join Loans to filter by branch)
-    let interestQuery = `
-      SELECT SUM(t.amount_paid) 
-      FROM Transactions t 
-      JOIN Loans l ON t.loan_id = l.id 
-      WHERE t.payment_type = 'interest' 
-      AND t.payment_date >= date_trunc('month', CURRENT_DATE)
-    `;
-    if (targetBranch) {
-        interestQuery += ` AND l.branch_id = $1`;
+    // 3. Calculate Total Interest Accrued
+    let totalInterestAccrued = 0;
+    
+    // Fetch all Active/Overdue loans for calculation
+    const loansQuery = `SELECT id, principal_amount, interest_rate, pledge_date FROM Loans ${whereClause} AND (status = 'active' OR status = 'overdue')`;
+    const loansResult = await db.query(loansQuery, params);
+    const activeLoans = loansResult.rows;
+
+    if (activeLoans.length > 0) {
+        const loanIds = activeLoans.map(l => l.id);
+        
+        const nextParamIndex = params.length + 1;
+        const txQuery = `SELECT loan_id, amount_paid, payment_type, payment_date FROM Transactions WHERE loan_id = ANY($${nextParamIndex}::int[])`;
+        
+        // --- FIX IS HERE: Corrected variable name to 'txResult' ---
+        const txResult = await db.query(txQuery, [...params, loanIds]);
+        const allTxs = txResult.rows; 
+
+        const today = new Date();
+
+        // Calculation Loop
+        for (const loan of activeLoans) {
+            const loanTxs = allTxs.filter(t => t.loan_id === loan.id);
+            
+            const currentPrincipal = parseFloat(loan.principal_amount);
+            const rate = parseFloat(loan.interest_rate);
+            const pledgeDate = new Date(loan.pledge_date);
+
+            const disbursementTxs = loanTxs.filter(t => t.payment_type === 'disbursement');
+            const interestPaid = loanTxs.filter(t => t.payment_type === 'interest').reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
+
+            const disbursementsSum = disbursementTxs.reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
+            const initialPrincipal = currentPrincipal - disbursementsSum;
+            
+            const events = [];
+            if (initialPrincipal > 0) events.push({ amount: initialPrincipal, date: pledgeDate });
+            disbursementTxs.forEach(t => events.push({ amount: parseFloat(t.amount_paid), date: new Date(t.payment_date) }));
+
+            let totalInterestGenerated = 0;
+            for (const event of events) {
+                const factor = calculateTotalMonthsFactor(event.date, today);
+                totalInterestGenerated += event.amount * (rate / 100) * factor;
+            }
+
+            const accrued = totalInterestGenerated - interestPaid;
+            if (accrued > 0) totalInterestAccrued += accrued;
+        }
     }
-    const interestRes = await db.query(interestQuery, params); // Params still has [branchId] if targetBranch exists
 
     res.json({
       totalPrincipalOut: parseFloat(principalRes.rows[0].sum || 0),
+      totalInterestAccrued: totalInterestAccrued,
       totalActiveLoans: parseInt(activeRes.rows[0].count || 0),
       totalOverdueLoans: parseInt(overdueRes.rows[0].count || 0),
-      interestCollectedThisMonth: parseFloat(interestRes.rows[0].sum || 0),
       totalCustomers: parseInt(customersRes.rows[0].count || 0),
       totalLoans: parseInt(loansRes.rows[0].count || 0),
       totalValue: parseFloat(disbursedRes.rows[0].sum || 0),
