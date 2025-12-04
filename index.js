@@ -87,6 +87,7 @@ const getTargetBranchId = (req) => {
 };
 
 // --- GLOBAL INTEREST CALCULATION FUNCTION ---
+// --- GLOBAL INTEREST CALCULATION FUNCTION ---
 const calculateTotalMonthsFactor = (startDate, endDate) => {
   const start = new Date(startDate);
   const end = new Date(endDate);
@@ -98,6 +99,7 @@ const calculateTotalMonthsFactor = (startDate, endDate) => {
   let fullMonthsPassed = 0;
   let tempDate = new Date(start);
 
+  // Count full months
   while (true) {
       const nextMonth = tempDate.getMonth() + 1;
       tempDate.setMonth(nextMonth);
@@ -117,36 +119,32 @@ const calculateTotalMonthsFactor = (startDate, endDate) => {
   let partialFraction = 0; 
   let totalMonthsFactor;
 
-  if (fullMonthsPassed === 0) { 
-    totalMonthsFactor = 1.0; 
-  } else { 
-    if (remainingDays > 0) { 
-      partialFraction = (remainingDays <= 15) ? 0.5 : 1.0; 
-    } 
-    totalMonthsFactor = fullMonthsPassed + partialFraction; 
+  // --- FIX START ---
+  // Allow slab calculation even if fullMonthsPassed is 0
+  if (remainingDays > 0) { 
+    partialFraction = (remainingDays <= 15) ? 0.5 : 1.0; 
   }
-
-  if (totalMonthsFactor === 0 && end >= start) {
-     totalMonthsFactor = 1.0; 
-  }
+  
+  totalMonthsFactor = fullMonthsPassed + partialFraction;
+  // --- FIX END ---
 
   return totalMonthsFactor;
 };
 
+// --- CORE LOGIC: REDUCING BALANCE INTEREST CALCULATOR ---
 // --- CORE LOGIC: REDUCING BALANCE INTEREST CALCULATOR ---
 const calculateLoanFinancials = (loan, transactions) => {
     const rate = parseFloat(loan.interest_rate);
     const pledgeDate = new Date(loan.pledge_date);
     const today = new Date();
     
-    // 1. Identify all events that change the principal balance
+    // 1. Identify events (Same as before...)
     let events = [];
     let principalPaid = 0;
     let interestPaid = 0;
     let totalPaid = 0;
     let totalDisbursedViaTx = 0;
 
-    // A. Parse Transactions
     transactions.forEach(tx => {
         const amt = parseFloat(tx.amount_paid);
         const date = new Date(tx.payment_date);
@@ -166,7 +164,6 @@ const calculateLoanFinancials = (loan, transactions) => {
         }
     });
 
-    // B. Determine Initial Disbursement
     const currentPrincipalLimit = parseFloat(loan.principal_amount); 
     const initialAmount = currentPrincipalLimit - totalDisbursedViaTx;
     
@@ -174,10 +171,10 @@ const calculateLoanFinancials = (loan, transactions) => {
         events.push({ date: pledgeDate, amount: initialAmount, type: 'add', label: 'Initial Principal' });
     }
 
-    // 2. Sort Events by Date
+    // 2. Sort Events
     events.sort((a, b) => a.date - b.date);
 
-    // 3. Walk through timeline to calculate interest on Running Balance
+    // 3. Walk through timeline
     let totalInterestGenerated = 0;
     let currentBalance = 0;
     let lastDate = null;
@@ -187,16 +184,18 @@ const calculateLoanFinancials = (loan, transactions) => {
         if (lastDate && currentBalance > 0 && event.date > lastDate) {
             const factor = calculateTotalMonthsFactor(lastDate, event.date);
             const interest = currentBalance * (rate / 100) * factor;
-            totalInterestGenerated += interest;
             
-            breakdown.push({
-                label: `Balance ₹${currentBalance.toFixed(0)}`,
-                amount: currentBalance.toString(),
-                date: lastDate.toISOString(),
-                endDate: event.date.toISOString(),
-                months: factor,
-                interest: interest.toFixed(2)
-            });
+            if (interest > 0) {
+                totalInterestGenerated += interest;
+                breakdown.push({
+                    label: `Balance ₹${currentBalance.toFixed(0)}`,
+                    amount: currentBalance.toString(),
+                    date: lastDate.toISOString(),
+                    endDate: event.date.toISOString(),
+                    months: factor,
+                    interest: interest.toFixed(2)
+                });
+            }
         }
         if (event.type === 'add') currentBalance += event.amount;
         else currentBalance -= event.amount;
@@ -219,6 +218,30 @@ const calculateLoanFinancials = (loan, transactions) => {
             });
         }
     }
+
+    // --- FIX START: Enforce Minimum 1 Month Interest on the Final Balance ---
+    // If total time is very short (e.g. 12 days), calculated might be 300 (0.5 slab).
+    // But user expects Minimum 1 Month (700).
+    const minInterest = currentBalance * (rate / 100) * 1.0;
+    
+    // Check if total calculated is less than 1 month of current balance
+    // AND if we are effectively in the first month (approx).
+    if (totalInterestGenerated < minInterest && totalInterestGenerated > 0) {
+         // Adjust the last entry or add a 'Minimum Adjustment'
+         const diff = minInterest - totalInterestGenerated;
+         totalInterestGenerated = minInterest;
+         
+         // Visual adjustment for the breakdown
+         breakdown.push({
+             label: "Minimum Interest Adjustment",
+             amount: "-",
+             date: new Date().toISOString(),
+             endDate: new Date().toISOString(),
+             months: 0,
+             interest: diff.toFixed(2)
+         });
+    }
+    // --- FIX END ---
 
     const outstandingPrincipal = currentBalance;
     const outstandingInterest = totalInterestGenerated - interestPaid;
