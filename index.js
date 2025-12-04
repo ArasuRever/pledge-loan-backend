@@ -1159,13 +1159,23 @@ app.get('/api/branches', authenticateToken, authorizeManagement, async (req, res
 });
 
 // 2. GET Single Branch
-app.get('/api/branches/:id', authenticateToken, authorizeAdmin, async (req, res) => {
+app.get('/api/branches/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await db.query("SELECT * FROM branches WHERE id = $1", [id]);
+    const branchId = parseInt(id);
+
+    // Security Check: 
+    // 1. Admins can see any branch.
+    // 2. Managers/Staff can ONLY see their assigned branch.
+    if (req.user.role !== 'admin' && req.user.branchId !== branchId) {
+        return res.status(403).send("Access Denied: You can only view your own branch details.");
+    }
+
+    const result = await db.query("SELECT * FROM branches WHERE id = $1", [branchId]);
     if (result.rows.length === 0) return res.status(404).send("Branch not found.");
     res.json(result.rows[0]);
   } catch (err) { 
+    console.error("Get Branch Details Error:", err);
     res.status(500).send("Server Error"); 
   }
 });
