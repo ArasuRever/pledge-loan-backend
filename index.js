@@ -133,6 +133,109 @@ const calculateTotalMonthsFactor = (startDate, endDate) => {
   return totalMonthsFactor;
 };
 
+// --- CORE LOGIC: REDUCING BALANCE INTEREST CALCULATOR ---
+const calculateLoanFinancials = (loan, transactions) => {
+    const rate = parseFloat(loan.interest_rate);
+    const pledgeDate = new Date(loan.pledge_date);
+    const today = new Date();
+    
+    // 1. Identify all events that change the principal balance
+    let events = [];
+    let principalPaid = 0;
+    let interestPaid = 0;
+    let totalPaid = 0;
+    let totalDisbursedViaTx = 0;
+
+    // A. Parse Transactions
+    transactions.forEach(tx => {
+        const amt = parseFloat(tx.amount_paid);
+        const date = new Date(tx.payment_date);
+        
+        if (tx.payment_type === 'disbursement') {
+            events.push({ date: date, amount: amt, type: 'add', label: 'Top-up' });
+            totalDisbursedViaTx += amt;
+        } else if (tx.payment_type === 'principal') {
+            events.push({ date: date, amount: amt, type: 'subtract', label: 'Repayment' });
+            principalPaid += amt;
+            totalPaid += amt;
+        } else if (tx.payment_type === 'interest') {
+            interestPaid += amt;
+            totalPaid += amt;
+        } else if (tx.payment_type !== 'discount') {
+            totalPaid += amt;
+        }
+    });
+
+    // B. Determine Initial Disbursement
+    const currentPrincipalLimit = parseFloat(loan.principal_amount); 
+    const initialAmount = currentPrincipalLimit - totalDisbursedViaTx;
+    
+    if (initialAmount > 0) {
+        events.push({ date: pledgeDate, amount: initialAmount, type: 'add', label: 'Initial Principal' });
+    }
+
+    // 2. Sort Events by Date
+    events.sort((a, b) => a.date - b.date);
+
+    // 3. Walk through timeline to calculate interest on Running Balance
+    let totalInterestGenerated = 0;
+    let currentBalance = 0;
+    let lastDate = null;
+    let breakdown = [];
+
+    for (const event of events) {
+        if (lastDate && currentBalance > 0 && event.date > lastDate) {
+            const factor = calculateTotalMonthsFactor(lastDate, event.date);
+            const interest = currentBalance * (rate / 100) * factor;
+            totalInterestGenerated += interest;
+            
+            breakdown.push({
+                label: `Balance ₹${currentBalance.toFixed(0)}`,
+                amount: currentBalance.toString(),
+                date: lastDate.toISOString(),
+                endDate: event.date.toISOString(),
+                months: factor,
+                interest: interest.toFixed(2)
+            });
+        }
+        if (event.type === 'add') currentBalance += event.amount;
+        else currentBalance -= event.amount;
+        lastDate = event.date; 
+    }
+
+    // 4. Final Period (Last Event -> Today)
+    if (loan.status === 'active' || loan.status === 'overdue') {
+        if (lastDate && currentBalance > 0 && today > lastDate) {
+            const factor = calculateTotalMonthsFactor(lastDate, today);
+            const interest = currentBalance * (rate / 100) * factor;
+            totalInterestGenerated += interest;
+
+            breakdown.push({
+                label: `Current Balance ₹${currentBalance.toFixed(0)}`,
+                amount: currentBalance.toString(),
+                date: lastDate.toISOString(),
+                months: factor,
+                interest: interest.toFixed(2)
+            });
+        }
+    }
+
+    const outstandingPrincipal = currentBalance;
+    const outstandingInterest = totalInterestGenerated - interestPaid;
+    const amountDue = outstandingPrincipal + outstandingInterest;
+
+    return {
+        totalInterestOwed: totalInterestGenerated.toFixed(2),
+        principalPaid: principalPaid.toFixed(2),
+        interestPaid: interestPaid.toFixed(2),
+        totalPaid: totalPaid.toFixed(2),
+        outstandingPrincipal: outstandingPrincipal.toFixed(2),
+        outstandingInterest: outstandingInterest.toFixed(2),
+        amountDue: amountDue.toFixed(2),
+        breakdown: breakdown
+    };
+};
+
 app.get('/', async (req, res) => {
   try {
     const { rows } = await db.query('SELECT NOW()');
@@ -339,23 +442,38 @@ app.get('/api/customers/:id', authenticateToken, async (req, res) => {
     const id = parseInt(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
     
-    const customerResult = await db.query("SELECT * FROM Customers WHERE id = $1 AND is_deleted = false", [id]);
+    // FIX: Join Branches to get branch_name
+    const query = `
+        SELECT c.*, b.branch_name 
+        FROM Customers c 
+        LEFT JOIN Branches b ON c.branch_id = b.id 
+        WHERE c.id = $1 AND c.is_deleted = false
+    `;
+    
+    const customerResult = await db.query(query, [id]);
     if (customerResult.rows.length === 0) return res.status(404).json({ error: "Customer not found." });
     
     const customer = customerResult.rows[0];
 
-    // Check Access (Manager/Staff can only view own branch)
-    if (req.user.role !== 'admin' && customer.branch_id !== req.user.branchId) {
+    // FIX: Strict Integer Comparison
+    const userRole = req.user.role;
+    const userBranchId = parseInt(req.user.branchId || 0);
+    const customerBranchId = parseInt(customer.branch_id || 0);
+
+    if (userRole !== 'admin' && customerBranchId !== userBranchId) {
         return res.status(403).json({ error: "Access Denied. Customer belongs to another branch." });
     }
 
     if (customer.customer_image_url) {
-      const imageBase64 = customer.customer_image_url.toString('base64');
-      let mimeType = imageBase64.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
-      customer.customer_image_url = `data:${mimeType};base64,${imageBase64}`;
+      const b64 = customer.customer_image_url.toString('base64');
+      let mimeType = b64.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
+      customer.customer_image_url = `data:${mimeType};base64,${b64}`;
     }
     res.json(customer);
-  } catch (err) { res.status(500).send("Server Error"); }
+  } catch (err) { 
+    console.error("Get Customer Details Error:", err);
+    res.status(500).send("Server Error"); 
+  }
 });
 
 app.post('/api/customers', authenticateToken, upload.single('photo'), async (req, res) => {
@@ -601,106 +719,34 @@ app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => 
 app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    if (isNaN(id)) return res.status(400).json({ error: "Invalid loan ID." });
-    
-    const check = await db.query("SELECT branch_id FROM Loans WHERE id = $1", [id]);
-    if (check.rows.length === 0) return res.status(404).json({ error: "Loan not found" });
-    
-    // Access Check
-    if (req.user.role !== 'admin' && check.rows[0].branch_id !== req.user.branchId) {
-        return res.status(403).json({ error: "Access Denied." });
-    }
-
-    await db.query("UPDATE Loans SET status = 'overdue' WHERE id = $1 AND due_date < NOW() AND status = 'active'", [id]);
-
-    const loanQuery = `
-      SELECT l.*, 
-             pi.item_type, pi.description, pi.quality, 
-             pi.weight, pi.gross_weight, pi.net_weight, pi.purity, 
-             pi.item_image_data, 
-             c.name AS customer_name, c.phone_number, c.address, c.customer_image_url 
-      FROM Loans l 
-      LEFT JOIN PledgedItems pi ON l.id = pi.loan_id 
-      JOIN Customers c ON l.customer_id = c.id 
-      WHERE l.id = $1 AND l.status != 'deleted' AND c.is_deleted = false
-    `;
-    const loanResult = await db.query(loanQuery, [id]);
+    const loanResult = await db.query("SELECT l.*, pi.item_type, pi.description, pi.quality, pi.weight, pi.gross_weight, pi.net_weight, pi.purity, pi.item_image_data, c.name AS customer_name, c.phone_number, c.address, c.customer_image_url FROM Loans l LEFT JOIN PledgedItems pi ON l.id = pi.loan_id JOIN Customers c ON l.customer_id = c.id WHERE l.id = $1", [id]);
     if (loanResult.rows.length === 0) return res.status(404).json({ error: "Loan not found." });
+    
     let loanDetails = loanResult.rows[0];
+    if (req.user.role !== 'admin' && loanDetails.branch_id !== req.user.branchId) return res.status(403).json({ error: "Access Denied." });
 
     const transactionsResult = await db.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [id]);
     const transactions = transactionsResult.rows;
 
-    // Calculation Logic
-    const currentPrincipalTotal = parseFloat(loanDetails.principal_amount);
-    const rate = parseFloat(loanDetails.interest_rate);
-    const pledgeDate = new Date(loanDetails.pledge_date);
-    const today = new Date();
-    
-    let totalInterestOwed = 0;
-    let principalPaid = 0;
-    let interestPaid = 0;
-    let totalPaid = 0;
-    const disbursementTxs = [];
-    
-    transactions.forEach(tx => {
-      const amount = parseFloat(tx.amount_paid);
-      if (tx.payment_type === 'disbursement') {
-        disbursementTxs.push({ amount: amount, date: new Date(tx.payment_date) });
-      } else {
-        if (tx.payment_type !== 'discount') {
-           totalPaid += amount;
-        }
-        if (tx.payment_type === 'principal') principalPaid += amount;
-        else if (tx.payment_type === 'interest') interestPaid += amount;
-      }
-    });
+    // USE NEW LOGIC
+    const financials = calculateLoanFinancials(loanDetails, transactions);
 
-    const subsequentDisbursementsSum = disbursementTxs.reduce((sum, tx) => sum + tx.amount, 0);
-    const initialPrincipal = currentPrincipalTotal - subsequentDisbursementsSum; 
-    const disbursements = [];
-    
-    if (initialPrincipal > 0) {
-        disbursements.push({ amount: initialPrincipal, date: pledgeDate, isInitial: true });
+    if (loanDetails.item_image_data) {
+        const b64 = loanDetails.item_image_data.toString('base64');
+        const mime = b64.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
+        loanDetails.item_image_data_url = `data:${mime};base64,${b64}`;
+    } delete loanDetails.item_image_data;
+    if (loanDetails.customer_image_url) {
+        const b64 = loanDetails.customer_image_url.toString('base64');
+        const mime = b64.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
+        loanDetails.customer_image_url = `data:${mime};base64,${b64}`;
     }
-    disbursements.push(...disbursementTxs.map(tx => ({ ...tx, isInitial: false })));
-    
-    const breakdown = [];
-    
-    disbursements.forEach((event, index) => {
-        const monthsFactor = calculateTotalMonthsFactor(event.date, today);
-        const interest = event.amount * (rate / 100) * monthsFactor;
-        totalInterestOwed += interest;
-        
-        breakdown.push({
-            label: event.isInitial ? 'Initial Principal' : `Top-up #${index}`,
-            amount: event.amount,
-            date: event.date,
-            months: monthsFactor,
-            interest: interest
-        });
-    });
-    
-    const outstandingPrincipal = currentPrincipalTotal - principalPaid;
-    const outstandingInterest = totalInterestOwed - interestPaid;
-    const amountDue = outstandingPrincipal + outstandingInterest;
-
-    if (loanDetails.item_image_data) { const ib64 = loanDetails.item_image_data.toString('base64'); let mt = ib64.startsWith('/9j/') ? 'image/jpeg' : 'image/png'; loanDetails.item_image_data_url = `data:${mt};base64,${ib64}`; } delete loanDetails.item_image_data;
-    if (loanDetails.customer_image_url) { const cb64 = loanDetails.customer_image_url.toString('base64'); let mt = cb64.startsWith('/9j/') ? 'image/jpeg' : 'image/png'; loanDetails.customer_image_url = `data:${mt};base64,${cb64}`; }
 
     res.json({ 
         loanDetails: loanDetails, 
         transactions: transactions.sort((a, b) => new Date(b.payment_date) - new Date(a.payment_date)),
-        interestBreakdown: breakdown, 
-        calculated: {
-          totalInterestOwed: totalInterestOwed.toFixed(2),
-          principalPaid: principalPaid.toFixed(2),
-          interestPaid: interestPaid.toFixed(2),
-          totalPaid: totalPaid.toFixed(2),
-          outstandingPrincipal: outstandingPrincipal.toFixed(2),
-          outstandingInterest: outstandingInterest.toFixed(2),
-          amountDue: amountDue.toFixed(2)
-        }
+        interestBreakdown: financials.breakdown, 
+        calculated: financials
     });
   } catch (err) { console.error("GET Loan Details Error:", err.message); res.status(500).send("Server Error"); }
 });
@@ -790,12 +836,9 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
     const { loan_id, amount_paid, payment_type } = req.body; 
     const loanId = parseInt(loan_id);
     const paymentAmount = parseFloat(amount_paid);
-    if (!loanId || !paymentAmount || paymentAmount <= 0) return res.status(400).json({ error: 'Valid Loan ID and positive amount required.' }); 
-
     await client.query('BEGIN');
 
-    // Access Check
-    const loanCheck = await client.query("SELECT branch_id, status, principal_amount, interest_rate, pledge_date FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
+    const loanCheck = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
     if (loanCheck.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Loan not found." }); }
     const loan = loanCheck.rows[0];
 
@@ -803,199 +846,85 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
         await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." });
     }
 
-    // Principal Payment logic
-    if (payment_type === 'principal') {
-      const newTransaction = await client.query(
-        "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", 
-        [loanId, paymentAmount, 'principal', username]
-      );
-      await client.query('COMMIT');
-      return res.status(201).json([newTransaction.rows[0]]);
-    }
-
-    // Interest Payment logic
+    // Interest Payment Smart Split Logic using new calculator
     if (payment_type === 'interest') {
-      if (loan.status === 'deleted') throw new Error('Cannot add transaction to a deleted loan.');
-      
-      const transactionsResult = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
-      const transactions = transactionsResult.rows;
-      const principal = parseFloat(loan.principal_amount);
-      const rate = parseFloat(loan.interest_rate);
-      const pledgeDate = new Date(loan.pledge_date);
-      const today = new Date();
-      let totalInterestOwed = 0;
-      let interestPaid = 0;
-      let principalPaid = 0;
-      const disbursementTxs = [];
-      transactions.forEach(tx => {
-        const amount = parseFloat(tx.amount_paid);
-        if (tx.payment_type === 'disbursement') disbursementTxs.push({ amount: amount, date: new Date(tx.payment_date) });
-        else if (tx.payment_type === 'principal') principalPaid += amount;
-        else if (tx.payment_type === 'interest') interestPaid += amount;
-      });
-      const subsequentDisbursementsSum = disbursementTxs.reduce((sum, tx) => sum + tx.amount, 0);
-      const initialPrincipal = principal - subsequentDisbursementsSum;
-      const disbursements = [];
-      if (initialPrincipal > 0) disbursements.push({ amount: initialPrincipal, date: pledgeDate, isInitial: true });
-      disbursements.push(...disbursementTxs.map(tx => ({ ...tx, isInitial: false })));
-      
-      disbursements.forEach(event => {
-          const monthsFactor = calculateTotalMonthsFactor(event.date, today);
-          totalInterestOwed += event.amount * (rate / 100) * monthsFactor;
-      });
-      
-      const outstandingInterest = totalInterestOwed - interestPaid;
+      const txRes = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
+      const financials = calculateLoanFinancials(loan, txRes.rows);
+      const outstandingInterest = parseFloat(financials.outstandingInterest);
 
-      // Smart Split: If paying more than owed interest, split rest to principal
       if (paymentAmount > outstandingInterest) {
-        const interestPayment = outstandingInterest > 0 ? outstandingInterest : 0; 
-        const principalPayment = paymentAmount - interestPayment; 
-        let createdTransactions = [];
-        if (interestPayment > 0) {
-          const interestTx = await client.query(
-            "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3) RETURNING *",
-            [loanId, interestPayment, username]
-          );
-          createdTransactions.push(interestTx.rows[0]);
+        const interestPart = outstandingInterest > 0 ? outstandingInterest : 0;
+        const principalPart = paymentAmount - interestPart;
+        let txs = [];
+        if (interestPart > 0) {
+           const r = await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3) RETURNING *", [loanId, interestPart, username]);
+           txs.push(r.rows[0]);
         }
-        const principalTx = await client.query(
-          "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3) RETURNING *",
-          [loanId, principalPayment, username]
-        );
-        createdTransactions.push(principalTx.rows[0]);
+        const r2 = await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3) RETURNING *", [loanId, principalPart, username]);
+        txs.push(r2.rows[0]);
         await client.query('COMMIT');
-        return res.status(201).json(createdTransactions);
-      } else {
-        const newTransaction = await client.query(
-          "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3) RETURNING *",
-          [loanId, paymentAmount, username]
-        );
-        await client.query('COMMIT');
-        return res.status(201).json([newTransaction.rows[0]]);
+        return res.status(201).json(txs);
       }
     }
 
-    // Other types
-    const newTransaction = await client.query(
-      "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", 
-      [loanId, paymentAmount, payment_type, username]
-    );
+    const newTx = await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", [loanId, paymentAmount, payment_type, username]);
     await client.query('COMMIT');
-    return res.status(201).json([newTransaction.rows[0]]);
-  } catch (err) {
-    await client.query('ROLLBACK'); console.error("POST Transaction Error:", err.message);
-    if (err.code === '23503') return res.status(404).json({ error: 'Loan not found.' });
-    res.status(500).send("Server Error");
-  } finally { client.release(); }
+    res.status(201).json([newTx.rows[0]]);
+  } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Server Error"); } finally { client.release(); }
 });
 
 app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
   const client = await db.pool.connect();
   const username = req.user.username;
   try {
-    const { id } = req.params;
-    const { discountAmount, settlementAmount } = req.body; 
-    const loanId = parseInt(id);
-    if (isNaN(loanId)) return res.status(400).json({ error: "Invalid loan ID." });
-
+    const loanId = parseInt(req.params.id);
+    const { discountAmount, settlementAmount } = req.body;
     const discount = parseFloat(discountAmount) || 0;
     const finalPayment = parseFloat(settlementAmount) || 0;
 
     await client.query('BEGIN');
-
-    const loanQuery = `SELECT branch_id, principal_amount, pledge_date, status, interest_rate FROM Loans WHERE id = $1 FOR UPDATE`;
-    const loanResult = await client.query(loanQuery, [loanId]);
-    if (loanResult.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Loan not found." }); }
-    const loan = loanResult.rows[0];
-
+    const loanRes = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
+    const loan = loanRes.rows[0];
     // Access Check
     if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) {
         await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." });
     }
 
-    if (loan.status !== 'active' && loan.status !== 'overdue') {
-      await client.query('ROLLBACK'); return res.status(400).json({ error: `Cannot settle a loan with status '${loan.status}'.` });
-    }
+    const txRes = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
+    
+    // Recalculate using new logic
+    const financials = calculateLoanFinancials(loan, txRes.rows);
+    const outstandingInterest = parseFloat(financials.outstandingInterest);
+    const totalDue = parseFloat(financials.amountDue);
 
-    const currentPrincipalTotal = parseFloat(loan.principal_amount);
-    const monthlyInterestRatePercent = parseFloat(loan.interest_rate);
-    const pledgeDate = new Date(loan.pledge_date);
-    const today = new Date();
-
-    const txResult = await client.query("SELECT amount_paid, payment_type, payment_date FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
-    const transactions = txResult.rows;
-
-    const disbursements = [];
-    let principalPaidBefore = 0;
-    let interestPaidBefore = 0;
-
-    transactions.forEach(tx => {
-        const amt = parseFloat(tx.amount_paid);
-        if (tx.payment_type === 'disbursement') disbursements.push({ amount: amt, date: new Date(tx.payment_date), isInitial: false });
-        else if (tx.payment_type === 'principal') principalPaidBefore += amt;
-        else if (tx.payment_type === 'interest') interestPaidBefore += amt;
-    });
-
-    const subsequentDisbursementsSum = disbursements.reduce((sum, d) => sum + d.amount, 0);
-    const initialPrincipal = currentPrincipalTotal - subsequentDisbursementsSum;
-    if (initialPrincipal > 0) disbursements.unshift({ amount: initialPrincipal, date: pledgeDate, isInitial: true });
-
-    let totalInterestAccrued = 0;
-    disbursements.forEach(d => {
-        const factor = calculateTotalMonthsFactor(d.date, today);
-        totalInterestAccrued += d.amount * (monthlyInterestRatePercent / 100) * factor;
-    });
-
-    const totalOwed = currentPrincipalTotal + totalInterestAccrued;
-    const totalPaidBefore = principalPaidBefore + interestPaidBefore; 
-    const outstandingBalance = totalOwed - totalPaidBefore;
-    const outstandingInterest = totalInterestAccrued - interestPaidBefore;
-
-    const remainingAfterPayment = outstandingBalance - finalPayment - discount;
-    if (remainingAfterPayment > 1.0) { 
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-          error: `Insufficient funds. Outstanding: ${outstandingBalance.toFixed(2)}, Payment+Discount: ${(finalPayment + discount).toFixed(2)}. Short by: ${remainingAfterPayment.toFixed(2)}`
-      });
+    const remaining = totalDue - finalPayment - discount;
+    if (remaining > 1.0) { 
+       await client.query('ROLLBACK');
+       return res.status(400).json({ error: `Insufficient funds. Due: ${totalDue}, Paid+Disc: ${finalPayment+discount}` });
     }
 
     if (finalPayment > 0) {
-        let interestComponent = 0;
-        let principalComponent = 0;
-
+        let interestPart = 0;
+        let principalPart = 0;
         if (outstandingInterest > 0) {
             if (finalPayment >= outstandingInterest) {
-                interestComponent = outstandingInterest;
-                principalComponent = finalPayment - outstandingInterest;
+                interestPart = outstandingInterest;
+                principalPart = finalPayment - outstandingInterest;
             } else {
-                interestComponent = finalPayment;
-                principalComponent = 0;
+                interestPart = finalPayment;
             }
         } else {
-            principalComponent = finalPayment;
+            principalPart = finalPayment;
         }
-
-        if (interestComponent > 0) {
-            await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)", [loanId, interestComponent, username]);
-        }
-        if (principalComponent > 0) {
-            await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3)", [loanId, principalComponent, username]);
-        }
+        if (interestPart > 0) await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)", [loanId, interestPart, username]);
+        if (principalPart > 0) await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3)", [loanId, principalPart, username]);
     }
-
-    if (discount > 0) {
-       await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'discount', NOW(), $3)", [loanId, discount, username]);
-    }
+    if (discount > 0) await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'discount', NOW(), $3)", [loanId, discount, username]);
 
     const closeLoan = await client.query("UPDATE Loans SET status = 'paid', closed_date = NOW() WHERE id = $1 RETURNING *", [loanId]);
     await client.query('COMMIT');
-    res.json({ message: `Loan successfully closed.`, loan: closeLoan.rows[0] });
-
-  } catch (err) {
-    await client.query('ROLLBACK'); console.error("Settle Loan Error:", err.message); res.status(500).send("Server Error");
-  } finally {
-    client.release();
-  }
+    res.json({ message: "Settled", loan: closeLoan.rows[0] });
+  } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Server Error"); } finally { client.release(); }
 });
 
 // Admin OR Manager can delete
@@ -1275,27 +1204,14 @@ app.put('/api/branches/:id', authenticateToken, authorizeAdmin, async (req, res)
 // --- DASHBOARD STATS (Fixed for Multi-Branch) ---
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
   try {
-    const targetBranch = getTargetBranchId(req); // Null (Admin All) or ID
-
-    // 1. Update Overdue Status
-    let updateQuery = "UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'";
-    // Use specific branch filter if applicable to optimize
-    if (targetBranch) updateQuery += ` AND branch_id = ${targetBranch}`; 
-    await db.query(updateQuery);
-
-    // 2. Build Base Filter for Counts
+    const targetBranch = getTargetBranchId(req);
     let whereClause = " WHERE 1=1 "; 
     const params = [];
+    if (targetBranch) { whereClause += ` AND branch_id = $1`; params.push(targetBranch); }
+    
+    await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'" + (targetBranch ? ` AND branch_id=${targetBranch}` : ""));
 
-    if (targetBranch) {
-        whereClause += ` AND branch_id = $1`;
-        params.push(targetBranch);
-    }
-
-    // 3. Fetch Basic Aggregates (Parallel)
-    const [
-      principalRes, activeRes, overdueRes, customersRes, loansRes, paidRes, forfeitedRes, disbursedRes
-    ] = await Promise.all([
+    const [principalRes, activeRes, overdueRes, customersRes, loansRes, paidRes, forfeitedRes, disbursedRes] = await Promise.all([
       db.query(`SELECT SUM(principal_amount) FROM Loans ${whereClause} AND (status = 'active' OR status = 'overdue')`, params),
       db.query(`SELECT COUNT(*) FROM Loans ${whereClause} AND (status = 'active' OR status = 'overdue')`, params),
       db.query(`SELECT COUNT(*) FROM Loans ${whereClause} AND status = 'overdue'`, params),
@@ -1305,60 +1221,29 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
       db.query(`SELECT COUNT(*) FROM Loans ${whereClause} AND status = 'forfeited'`, params),
       db.query(`SELECT SUM(principal_amount) FROM Loans ${whereClause} AND status != 'deleted'`, params)
     ]);
-    
-    // 4. Calculate Total Interest Accrued (Complex Logic)
+
+    // Calculate Exact Accrued Interest using new function
     let totalInterestAccrued = 0;
-    
-    // Fetch active loans to calculate their specific interest
-    const loansQuery = `SELECT id, principal_amount, interest_rate, pledge_date FROM Loans ${whereClause} AND (status = 'active' OR status = 'overdue')`;
+    const loansQuery = `SELECT * FROM Loans ${whereClause} AND (status = 'active' OR status = 'overdue')`;
     const loansResult = await db.query(loansQuery, params);
     const activeLoans = loansResult.rows;
 
     if (activeLoans.length > 0) {
         const loanIds = activeLoans.map(l => l.id);
-        
-        // FIX: Simplified Query. We don't rely on 'params' here.
-        // We just pass loanIds as the first and only argument ($1)
-        const txQuery = `SELECT loan_id, amount_paid, payment_type, payment_date FROM Transactions WHERE loan_id = ANY($1::int[])`;
+        const txQuery = `SELECT * FROM Transactions WHERE loan_id = ANY($1::int[])`;
         const txResult = await db.query(txQuery, [loanIds]);
-        const allTxs = txResult.rows; 
+        const allTxs = txResult.rows;
 
-        const today = new Date();
-
-        // Iterate and Calculate
         for (const loan of activeLoans) {
             const loanTxs = allTxs.filter(t => t.loan_id === loan.id);
-            
-            const currentPrincipal = parseFloat(loan.principal_amount);
-            const rate = parseFloat(loan.interest_rate);
-            const pledgeDate = new Date(loan.pledge_date);
-
-            const disbursementTxs = loanTxs.filter(t => t.payment_type === 'disbursement');
-            const interestPaid = loanTxs.filter(t => t.payment_type === 'interest').reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
-
-            // Reconstruct timeline
-            const disbursementsSum = disbursementTxs.reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
-            const initialPrincipal = currentPrincipal - disbursementsSum;
-            
-            const events = [];
-            if (initialPrincipal > 0) events.push({ amount: initialPrincipal, date: pledgeDate });
-            disbursementTxs.forEach(t => events.push({ amount: parseFloat(t.amount_paid), date: new Date(t.payment_date) }));
-
-            let totalInterestGenerated = 0;
-            for (const event of events) {
-                const factor = calculateTotalMonthsFactor(event.date, today);
-                totalInterestGenerated += event.amount * (rate / 100) * factor;
-            }
-
-            const accrued = totalInterestGenerated - interestPaid;
-            // Only add positive accrued amount (if they overpaid interest, we don't subtract it from total)
-            if (accrued > 0) totalInterestAccrued += accrued;
+            const financials = calculateLoanFinancials(loan, loanTxs);
+            totalInterestAccrued += parseFloat(financials.outstandingInterest);
         }
     }
 
     res.json({
       totalPrincipalOut: parseFloat(principalRes.rows[0].sum || 0),
-      totalInterestAccrued: totalInterestAccrued,
+      totalInterestAccrued: totalInterestAccrued, 
       totalActiveLoans: parseInt(activeRes.rows[0].count || 0),
       totalOverdueLoans: parseInt(overdueRes.rows[0].count || 0),
       totalCustomers: parseInt(customersRes.rows[0].count || 0),
@@ -1369,10 +1254,7 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
       loansPaid: parseInt(paidRes.rows[0].count || 0),
       loansForfeited: parseInt(forfeitedRes.rows[0].count || 0)
     });
-  } catch (err) { 
-    console.error("Dashboard Stats Error:", err); 
-    res.status(500).send("Server Error."); 
-  }
+  } catch (err) { res.status(500).send("Server Error."); }
 });
 
 // --- REPORTS (Scoped) ---
@@ -1613,121 +1495,42 @@ app.delete('/api/loans/:id/permanent-delete', authenticateToken, authorizeAdmin,
 app.post('/api/loans/:id/renew', authenticateToken, async (req, res) => {
   const client = await db.pool.connect();
   const username = req.user.username;
-  const oldLoanId = parseInt(req.params.id);
-  const { interestPaid, newBookLoanNumber, newInterestRate } = req.body;
-
-  if (isNaN(oldLoanId)) return res.status(400).json({ error: "Invalid Loan ID." });
-  if (!newBookLoanNumber) return res.status(400).json({ error: "New Book Loan Number is required." });
-
   try {
+    const oldLoanId = parseInt(req.params.id);
+    const { interestPaid, newBookLoanNumber, newInterestRate } = req.body;
     await client.query('BEGIN');
     
-    // Fetch old loan (lock it)
-    const oldLoanRes = await client.query(`
-      SELECT l.*, pi.item_type, pi.description, pi.quality, 
-             pi.weight, pi.gross_weight, pi.net_weight, pi.purity, l.appraised_value, pi.item_image_data
-      FROM Loans l 
-      JOIN PledgedItems pi ON l.id = pi.loan_id 
-      WHERE l.id = $1 FOR UPDATE`, [oldLoanId]);
-
-    if (oldLoanRes.rows.length === 0) throw new Error("Loan not found.");
+    const oldLoanRes = await client.query("SELECT l.*, pi.* FROM Loans l JOIN PledgedItems pi ON l.id = pi.loan_id WHERE l.id = $1 FOR UPDATE", [oldLoanId]);
     const oldLoan = oldLoanRes.rows[0];
-
-    // Branch Access Check
+    
     if (req.user.role !== 'admin' && oldLoan.branch_id !== req.user.branchId) {
-        throw new Error("Access Denied. Cannot renew loan of another branch.");
+         throw new Error("Access Denied.");
     }
 
-    if (oldLoan.status !== 'active' && oldLoan.status !== 'overdue') throw new Error("Can only renew Active or Overdue loans.");
-
     const txRes = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [oldLoanId]);
-    const transactions = txRes.rows;
-
-    const currentPrincipalTotal = parseFloat(oldLoan.principal_amount);
-    const rate = parseFloat(oldLoan.interest_rate);
-    const pledgeDate = new Date(oldLoan.pledge_date);
-    const today = new Date();
-
-    let interestPaidTotal = 0;
-    const disbursementTxs = [];
-
-    transactions.forEach(tx => {
-      const amt = parseFloat(tx.amount_paid);
-      if (tx.payment_type === 'disbursement') disbursementTxs.push({ amount: amt, date: new Date(tx.payment_date) });
-      else if (tx.payment_type === 'interest') interestPaidTotal += amt;
-    });
-
-    const subsequentDisbursementsSum = disbursementTxs.reduce((sum, tx) => sum + tx.amount, 0);
-    const initialPrincipal = currentPrincipalTotal - subsequentDisbursementsSum;
+    const financials = calculateLoanFinancials(oldLoan, txRes.rows);
     
-    const events = [];
-    if (initialPrincipal > 0) events.push({ amount: initialPrincipal, date: pledgeDate });
-    disbursementTxs.forEach(tx => events.push({ amount: tx.amount, date: tx.date }));
+    const outstandingInterest = parseFloat(financials.outstandingInterest);
+    const outstandingPrincipal = parseFloat(financials.outstandingPrincipal); // This is the REDUCED principal
 
-    let totalInterestAccrued = 0;
-    events.forEach(e => {
-        const factor = calculateTotalMonthsFactor(e.date, today);
-        totalInterestAccrued += e.amount * (rate / 100) * factor;
-    });
-
-    const outstandingInterest = totalInterestAccrued - interestPaidTotal;
     const payingNow = parseFloat(interestPaid) || 0;
     const unpaidInterest = outstandingInterest - payingNow;
     const interestToCapitalize = unpaidInterest > 0 ? unpaidInterest : 0;
-    const newPrincipalAmount = currentPrincipalTotal + interestToCapitalize;
-
-    if (payingNow > 0) {
-        await client.query(
-            "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)",
-            [oldLoanId, payingNow, username]
-        );
-    }
     
+    const newPrincipalAmount = outstandingPrincipal + interestToCapitalize;
+
+    if (payingNow > 0) await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)", [oldLoanId, payingNow, username]);
     await client.query("UPDATE Loans SET status = 'renewed', closed_date = NOW() WHERE id = $1", [oldLoanId]);
 
-    const newRate = newInterestRate || oldLoan.interest_rate;
-    // IMPORTANT: New Loan inherits the SAME Branch ID
-    const newLoanQuery = `
-      INSERT INTO Loans (customer_id, principal_amount, interest_rate, book_loan_number, appraised_value, pledge_date, due_date, branch_id) 
-      VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '1 year', $6) 
-      RETURNING id`;
-      
-    const newLoanRes = await client.query(newLoanQuery, [
-        oldLoan.customer_id, 
-        newPrincipalAmount, 
-        newRate, 
-        newBookLoanNumber, 
-        oldLoan.appraised_value || 0,
-        oldLoan.branch_id // Preserve Branch
-    ]);
-    const newLoanId = newLoanRes.rows[0].id;
-
-    const itemQuery = `
-      INSERT INTO PledgedItems (loan_id, item_type, description, quality, weight, gross_weight, net_weight, purity, item_image_data)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-    `;
-    await client.query(itemQuery, [
-        newLoanId, oldLoan.item_type, oldLoan.description, oldLoan.quality, 
-        oldLoan.weight, oldLoan.gross_weight, oldLoan.net_weight, oldLoan.purity, oldLoan.item_image_data
-    ]);
-
-    let logMsg = `Renewed from #${oldLoan.book_loan_number}.`;
-    if (interestToCapitalize > 0) logMsg += ` Principal increased by ₹${interestToCapitalize.toFixed(2)} (Unpaid Interest).`;
+    const newLoanQuery = `INSERT INTO Loans (customer_id, principal_amount, interest_rate, book_loan_number, appraised_value, pledge_date, due_date, branch_id) VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '1 year', $6) RETURNING id`;
+    const newLoanRes = await client.query(newLoanQuery, [oldLoan.customer_id, newPrincipalAmount, newInterestRate || oldLoan.interest_rate, newBookLoanNumber, oldLoan.appraised_value, oldLoan.branch_id]);
     
-    await client.query(
-        "INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username) VALUES ($1, 'renewal', $2, $3, $4)",
-        [newLoanId, logMsg, 'Active', username] 
-    );
+    const itemQuery = `INSERT INTO PledgedItems (loan_id, item_type, description, quality, weight, gross_weight, net_weight, purity, item_image_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`;
+    await client.query(itemQuery, [newLoanRes.rows[0].id, oldLoan.item_type, oldLoan.description, oldLoan.quality, oldLoan.weight, oldLoan.gross_weight, oldLoan.net_weight, oldLoan.purity, oldLoan.item_image_data]);
 
     await client.query('COMMIT');
-    res.json({ message: `Renewed! New Principal: ₹${newPrincipalAmount.toFixed(2)}`, newLoanId: newLoanId });
-
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error("Renewal Error:", err.message);
-    if (err.code === '23505') return res.status(400).json({ error: "New Book Loan Number already exists." });
-    res.status(500).json({ error: err.message });
-  } finally { client.release(); }
+    res.json({ message: "Renewed", newLoanId: newLoanRes.rows[0].id });
+  } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Server Error"); } finally { client.release(); }
 });
 
 // --- SETTINGS (Admin Only) ---
