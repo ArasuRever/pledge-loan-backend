@@ -1,4 +1,3 @@
-
 const express = require('express');
 const db = require('./db');
 const cors = require('cors');
@@ -19,12 +18,9 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
     if (allowedOrigins.indexOf(origin) === -1) {
-      // In development, you might want to allow all, but for security in prod:
-      // return callback(new Error('The CORS policy for this site does not allow access from the specified Origin.'), false);
-      return callback(null, true); // Permissive for now to ensure your mobile app connects easily
+      return callback(null, true); 
     }
     return callback(null, true);
   }
@@ -59,7 +55,6 @@ const authorizeAdmin = (req, res, next) => {
   next();
 };
 
-// Allows Admin OR Manager
 const authorizeManagement = (req, res, next) => {
   if (['admin', 'manager'].includes(req.user.role)) {
     next();
@@ -69,195 +64,161 @@ const authorizeManagement = (req, res, next) => {
 };
 
 // --- HELPER: GET TARGET BRANCH ID ---
-// Returns null if "All Branches" (Admin only), or specific ID for filtering
 const getTargetBranchId = (req) => {
   const { role, branchId: userBranchId } = req.user;
   const { branchId: queryBranchId } = req.query;
 
   if (role === 'admin') {
-    // Admin can see ALL (null) or specific branch if requested
     if (queryBranchId && queryBranchId !== 'all') {
       return parseInt(queryBranchId);
     }
-    return null; // Return null to signify "No Filter / All Branches"
+    return null; 
   } else {
-    // Managers and Staff are ALWAYS locked to their assigned branch
     return userBranchId;
   }
 };
 
-// --- GLOBAL INTEREST CALCULATION FUNCTION ---
-// --- GLOBAL INTEREST CALCULATION FUNCTION ---
-const calculateTotalMonthsFactor = (startDate, endDate) => {
-  const start = new Date(startDate);
-  const end = new Date(endDate);
-  start.setHours(0,0,0,0);
-  end.setHours(0,0,0,0);
+// =================================================================
+// 🆕 NEW LOGIC: MONTH CALCULATION (1 Day = 0.5, >15 Days = 1.0)
+// =================================================================
+const calculateGoldLoanMonths = (pledgeDateStr, currentDateStr) => {
+  const pledgeDate = new Date(pledgeDateStr);
+  const current = new Date(currentDateStr);
 
-  if (end < start) return 0; 
+  // 1. Calculate full months passed
+  let months = (current.getFullYear() - pledgeDate.getFullYear()) * 12;
+  months -= pledgeDate.getMonth();
+  months += current.getMonth();
 
-  let fullMonthsPassed = 0;
-  let tempDate = new Date(start);
+  // 2. Adjust for specific day
+  const pledgeDay = pledgeDate.getDate();
+  const currentDay = current.getDate();
+  
+  let dayDifference = currentDay - pledgeDay;
 
-  // Count full months
-  while (true) {
-      const nextMonth = tempDate.getMonth() + 1;
-      tempDate.setMonth(nextMonth);
-      if (tempDate.getMonth() !== (nextMonth % 12)) tempDate.setDate(0); 
-      
-      if (tempDate <= end) { 
-        fullMonthsPassed++; 
-      } else { 
-        tempDate.setMonth(tempDate.getMonth() - 1); 
-        break; 
-      }
+  // If current day is before pledge day in the month, we haven't completed the cycle
+  if (dayDifference < 0) {
+    months--;
+    dayDifference += 30; // Approx adjustment
   }
 
-  const oneDay = 1000 * 60 * 60 * 24;
-  const remainingDays = Math.floor((end.getTime() - tempDate.getTime()) / oneDay);
+  // --- RULE IMPLEMENTATION ---
+  if (months < 0) return 1; // Minimum 1 month safety
   
-  let partialFraction = 0; 
-  let totalMonthsFactor;
+  let totalDuration = months;
 
-  // --- FIX START ---
-  // Allow slab calculation even if fullMonthsPassed is 0
-  if (remainingDays > 0) { 
-    partialFraction = (remainingDays <= 15) ? 0.5 : 1.0; 
+  // Partial Month Logic
+  if (dayDifference > 0) {
+    if (dayDifference <= 15) {
+      totalDuration += 0.5; // 1-15 days extra = 0.5 month
+    } else {
+      totalDuration += 1.0; // >15 days extra = 1.0 month
+    }
   }
-  
-  totalMonthsFactor = fullMonthsPassed + partialFraction;
-  // --- FIX END ---
 
-  return totalMonthsFactor;
+  // Final check: Minimum duration is always 1 month
+  return totalDuration < 1 ? 1 : totalDuration;
 };
 
-// --- CORE LOGIC: REDUCING BALANCE INTEREST CALCULATOR ---
-// --- CORE LOGIC: REDUCING BALANCE INTEREST CALCULATOR ---
+// =================================================================
+// 🆕 NEW LOGIC: BUCKET FINANCIAL CALCULATOR (Initial vs Top-up)
+// =================================================================
 const calculateLoanFinancials = (loan, transactions) => {
-    const rate = parseFloat(loan.interest_rate);
-    const pledgeDate = new Date(loan.pledge_date);
-    const today = new Date();
-    
-    // 1. Identify events (Same as before...)
-    let events = [];
-    let principalPaid = 0;
-    let interestPaid = 0;
-    let totalPaid = 0;
-    let totalDisbursedViaTx = 0;
+    // 1. Separate Transactions
+    const disbursements = transactions.filter(t => t.payment_type === 'disbursement');
+    const payments = transactions.filter(t => t.payment_type !== 'disbursement' && t.payment_type !== 'discount');
+    const discountTx = transactions.filter(t => t.payment_type === 'discount');
 
-    transactions.forEach(tx => {
-        const amt = parseFloat(tx.amount_paid);
-        const date = new Date(tx.payment_date);
-        
-        if (tx.payment_type === 'disbursement') {
-            events.push({ date: date, amount: amt, type: 'add', label: 'Top-up' });
-            totalDisbursedViaTx += amt;
-        } else if (tx.payment_type === 'principal') {
-            events.push({ date: date, amount: amt, type: 'subtract', label: 'Repayment' });
-            principalPaid += amt;
-            totalPaid += amt;
-        } else if (tx.payment_type === 'interest') {
-            interestPaid += amt;
-            totalPaid += amt;
-        } else if (tx.payment_type !== 'discount') {
-            totalPaid += amt;
-        }
+    const pledgeDate = new Date(loan.pledge_date);
+    const today = new Date(); // Or closed_date if loan is paid
+    const endDate = loan.status === 'paid' && loan.closed_date ? new Date(loan.closed_date) : today;
+
+    // 2. Build Principal Buckets (Initial vs Top-ups)
+    // Logic: Initial Principal = Current DB Principal - Sum of TopUp Disbursements
+    // A TopUp is any disbursement NOT in the same month/year as Pledge Date
+    
+    let topUpSum = 0;
+    const buckets = [];
+    const breakdown = []; // For UI Display
+
+    disbursements.forEach(tx => {
+       const txDate = new Date(tx.payment_date);
+       const isSameMonth = (txDate.getMonth() === pledgeDate.getMonth()) && (txDate.getFullYear() === pledgeDate.getFullYear());
+
+       if (!isSameMonth) {
+           // This is a Top Up
+           const amount = parseFloat(tx.amount_paid);
+           topUpSum += amount;
+           
+           const duration = calculateGoldLoanMonths(txDate, endDate);
+           const interest = (amount * parseFloat(loan.interest_rate) * duration) / 100;
+           
+           buckets.push({ type: 'addon', amount, interest });
+           breakdown.push({
+               label: `Top-up (${txDate.toLocaleDateString('en-IN')})`,
+               amount: amount.toString(),
+               date: txDate.toISOString(),
+               endDate: endDate.toISOString(),
+               months: duration,
+               interest: interest.toFixed(2)
+           });
+       }
     });
 
-    const currentPrincipalLimit = parseFloat(loan.principal_amount); 
-    const initialAmount = currentPrincipalLimit - totalDisbursedViaTx;
-    
-    if (initialAmount > 0) {
-        events.push({ date: pledgeDate, amount: initialAmount, type: 'add', label: 'Initial Principal' });
+    const currentPrincipalTotal = parseFloat(loan.principal_amount);
+    const initialPrincipalAmount = currentPrincipalTotal - topUpSum;
+
+    if (initialPrincipalAmount > 0) {
+        const duration = calculateGoldLoanMonths(pledgeDate, endDate);
+        const interest = (initialPrincipalAmount * parseFloat(loan.interest_rate) * duration) / 100;
+        
+        buckets.push({ type: 'initial', amount: initialPrincipalAmount, interest });
+        // Add to start of breakdown
+        breakdown.unshift({
+            label: "Initial Principal",
+            amount: initialPrincipalAmount.toString(),
+            date: pledgeDate.toISOString(),
+            endDate: endDate.toISOString(),
+            months: duration,
+            interest: interest.toFixed(2)
+        });
     }
 
-    // 2. Sort Events
-    events.sort((a, b) => a.date - b.date);
+    // 3. Calculate Totals
+    const totalInterestAccrued = buckets.reduce((sum, b) => sum + b.interest, 0);
+    const totalPaid = payments.reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
+    const totalDiscount = discountTx.reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
 
-    // 3. Walk through timeline
-    let totalInterestGenerated = 0;
-    let currentBalance = 0;
-    let lastDate = null;
-    let breakdown = [];
+    // 4. Waterfall (Interest First)
+    let remainingPayment = totalPaid + totalDiscount;
+    let interestPaid = 0;
+    let principalPaid = 0;
 
-    for (const event of events) {
-        if (lastDate && currentBalance > 0 && event.date > lastDate) {
-            const factor = calculateTotalMonthsFactor(lastDate, event.date);
-            const interest = currentBalance * (rate / 100) * factor;
-            
-            if (interest > 0) {
-                totalInterestGenerated += interest;
-                breakdown.push({
-                    label: `Balance ₹${currentBalance.toFixed(0)}`,
-                    amount: currentBalance.toString(),
-                    date: lastDate.toISOString(),
-                    endDate: event.date.toISOString(),
-                    months: factor,
-                    interest: interest.toFixed(2)
-                });
-            }
-        }
-        if (event.type === 'add') currentBalance += event.amount;
-        else currentBalance -= event.amount;
-        lastDate = event.date; 
+    if (remainingPayment >= totalInterestAccrued) {
+        interestPaid = totalInterestAccrued;
+        remainingPayment -= totalInterestAccrued;
+        principalPaid = remainingPayment; 
+    } else {
+        interestPaid = remainingPayment;
+        principalPaid = 0;
     }
 
-    // 4. Final Period (Last Event -> Today)
-    if (loan.status === 'active' || loan.status === 'overdue') {
-        if (lastDate && currentBalance > 0 && today > lastDate) {
-            const factor = calculateTotalMonthsFactor(lastDate, today);
-            const interest = currentBalance * (rate / 100) * factor;
-            totalInterestGenerated += interest;
-
-            breakdown.push({
-                label: `Current Balance ₹${currentBalance.toFixed(0)}`,
-                amount: currentBalance.toString(),
-                date: lastDate.toISOString(),
-                months: factor,
-                interest: interest.toFixed(2)
-            });
-        }
-    }
-
-    // --- FIX START: Enforce Minimum 1 Month Interest on the Final Balance ---
-    // If total time is very short (e.g. 12 days), calculated might be 300 (0.5 slab).
-    // But user expects Minimum 1 Month (700).
-    const minInterest = currentBalance * (rate / 100) * 1.0;
-    
-    // Check if total calculated is less than 1 month of current balance
-    // AND if we are effectively in the first month (approx).
-    if (totalInterestGenerated < minInterest && totalInterestGenerated > 0) {
-         // Adjust the last entry or add a 'Minimum Adjustment'
-         const diff = minInterest - totalInterestGenerated;
-         totalInterestGenerated = minInterest;
-         
-         // Visual adjustment for the breakdown
-         breakdown.push({
-             label: "Minimum Interest Adjustment",
-             amount: "-",
-             date: new Date().toISOString(),
-             endDate: new Date().toISOString(),
-             months: 0,
-             interest: diff.toFixed(2)
-         });
-    }
-    // --- FIX END ---
-
-    const outstandingPrincipal = currentBalance;
-    const outstandingInterest = totalInterestGenerated - interestPaid;
+    const outstandingPrincipal = currentPrincipalTotal - principalPaid;
+    const outstandingInterest = totalInterestAccrued - interestPaid;
     const amountDue = outstandingPrincipal + outstandingInterest;
 
     return {
-        totalInterestOwed: totalInterestGenerated.toFixed(2),
+        totalInterestOwed: totalInterestAccrued.toFixed(2), // Total generated
         principalPaid: principalPaid.toFixed(2),
         interestPaid: interestPaid.toFixed(2),
         totalPaid: totalPaid.toFixed(2),
-        outstandingPrincipal: outstandingPrincipal.toFixed(2),
-        outstandingInterest: outstandingInterest.toFixed(2),
-        amountDue: amountDue.toFixed(2),
-        breakdown: breakdown
+        outstandingPrincipal: outstandingPrincipal > 0 ? outstandingPrincipal.toFixed(2) : "0.00",
+        outstandingInterest: outstandingInterest > 0 ? outstandingInterest.toFixed(2) : "0.00",
+        amountDue: amountDue > 0 ? amountDue.toFixed(2) : "0.00",
+        breakdown: breakdown // Compatible with UI
     };
 };
+// =================================================================
 
 app.get('/', async (req, res) => {
   try {
@@ -431,6 +392,7 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
         FROM Customers c
         LEFT JOIN Loans l ON c.id = l.customer_id AND l.status != 'deleted'
         LEFT JOIN Branches b ON c.branch_id = b.id
+        LEFT JOIN Branches b2 ON l.branch_id = b2.id
         WHERE c.is_deleted = false
     `;
 
@@ -751,7 +713,7 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
     const transactionsResult = await db.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [id]);
     const transactions = transactionsResult.rows;
 
-    // USE NEW LOGIC
+    // USE NEW BUCKET LOGIC
     const financials = calculateLoanFinancials(loanDetails, transactions);
 
     if (loanDetails.item_image_data) {
@@ -869,9 +831,10 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
         await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." });
     }
 
-    // Interest Payment Smart Split Logic using new calculator
+    // Interest Payment Smart Split Logic using NEW BUCKET CALCULATOR
     if (payment_type === 'interest') {
       const txRes = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
+      
       const financials = calculateLoanFinancials(loan, txRes.rows);
       const outstandingInterest = parseFloat(financials.outstandingInterest);
 
@@ -915,7 +878,7 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
 
     const txRes = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
     
-    // Recalculate using new logic
+    // Recalculate using NEW BUCKET LOGIC
     const financials = calculateLoanFinancials(loan, txRes.rows);
     const outstandingInterest = parseFloat(financials.outstandingInterest);
     const totalDue = parseFloat(financials.amountDue);
@@ -1139,16 +1102,12 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
 
 // --- BRANCH MANAGEMENT ROUTES (Admin/Manager) ---
 // 1. GET ALL Branches
-// 1. GET ALL Branches
 app.get('/api/branches', authenticateToken, authorizeManagement, async (req, res) => {
   try {
     if (req.user.role === 'admin') {
-        // FIX: Changed to SELECT * to get 'is_active', 'address', etc.
-        // FIX: Removed 'WHERE is_active = true' so Admins can see Inactive branches too.
         const result = await db.query("SELECT * FROM branches ORDER BY id ASC");
         res.json(result.rows);
     } else {
-        // Manager sees only their own branch (also getting all details now)
         const result = await db.query("SELECT * FROM branches WHERE id = $1", [req.user.branchId]);
         res.json(result.rows);
     }
@@ -1164,9 +1123,6 @@ app.get('/api/branches/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const branchId = parseInt(id);
 
-    // Security Check: 
-    // 1. Admins can see any branch.
-    // 2. Managers/Staff can ONLY see their assigned branch.
     if (req.user.role !== 'admin' && req.user.branchId !== branchId) {
         return res.status(403).send("Access Denied: You can only view your own branch details.");
     }
@@ -1202,17 +1158,13 @@ app.post('/api/branches', authenticateToken, authorizeAdmin, async (req, res) =>
 app.put('/api/branches/:id', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    // ADD license_number to extraction
     const { branch_name, branch_code, address, phone_number, license_number, is_active } = req.body;
 
-    // We must fetch existing data first if some fields are missing (Partial Update logic)
-    // allowing the frontend to send only address/phone if it wants.
     const existing = await db.query("SELECT * FROM branches WHERE id = $1", [id]);
     if (existing.rows.length === 0) return res.status(404).send("Branch not found.");
     
     const old = existing.rows[0];
     
-    // Fallback to existing values if new ones are undefined
     const newName = branch_name || old.branch_name;
     const newCode = branch_code || old.branch_code;
     const newAddr = address || old.address;
@@ -1229,7 +1181,7 @@ app.put('/api/branches/:id', authenticateToken, authorizeAdmin, async (req, res)
     
     res.json(result.rows[0]);
   } catch (err) {
-    console.error("Update Branch Error:", err); // Added logging
+    console.error("Update Branch Error:", err); 
     res.status(500).send("Server Error");
   }
 });
@@ -1537,14 +1489,16 @@ app.post('/api/loans/:id/renew', authenticateToken, async (req, res) => {
     const oldLoan = oldLoanRes.rows[0];
     
     if (req.user.role !== 'admin' && oldLoan.branch_id !== req.user.branchId) {
-         throw new Error("Access Denied.");
+          throw new Error("Access Denied.");
     }
 
     const txRes = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [oldLoanId]);
+    
+    // Use New Logic
     const financials = calculateLoanFinancials(oldLoan, txRes.rows);
     
     const outstandingInterest = parseFloat(financials.outstandingInterest);
-    const outstandingPrincipal = parseFloat(financials.outstandingPrincipal); // This is the REDUCED principal
+    const outstandingPrincipal = parseFloat(financials.outstandingPrincipal); 
 
     const payingNow = parseFloat(interestPaid) || 0;
     const unpaidInterest = outstandingInterest - payingNow;
