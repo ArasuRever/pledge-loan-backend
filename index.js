@@ -168,8 +168,7 @@ const calculateLoanFinancials = (loan, transactions) => {
         eventsMap.set(dateKey, {
             date: parseDate(ev.date),
             disburse: 0,
-            waterfallPay: 0, // Interest First
-            principalPay: 0, // Principal Only
+            payment: 0,
             discount: 0,
             types: new Set(),
             topupDetails: [] 
@@ -181,12 +180,8 @@ const calculateLoanFinancials = (loan, transactions) => {
         group.disburse += ev.amount;
         group.topupDetails.push({ amount: ev.amount, isInitial: ev.isInitial });
     } else if (ev.type === 'payment') {
+        group.payment += ev.amount;
         group.types.add(ev.originalType);
-        if (ev.originalType === 'principal') {
-            group.principalPay += ev.amount;
-        } else {
-            group.waterfallPay += ev.amount;
-        }
     } else if (ev.type === 'discount') {
         group.discount += ev.amount;
     }
@@ -198,15 +193,11 @@ const calculateLoanFinancials = (loan, transactions) => {
   processedEvents.push({ 
       date: parseDate(endDate), 
       isReport: true,
-      disburse: 0, waterfallPay: 0, principalPay: 0, discount: 0, types: new Set(), topupDetails: []
+      disburse: 0, payment: 0, discount: 0, types: new Set(), topupDetails: []
   });
 
   // --- CALCULATION LOOP ---
   let activePrincipals = []; 
-  
-  // "Locked" Interest: Unpaid interest from OLD principal buckets
-  let lockedInterest = 0; 
-  // "Current" Interest: Interest on CURRENT active principals
   let accruedInterestSnapshot = 0; 
   
   let totalPrincipalPaid = 0;
@@ -216,52 +207,6 @@ const calculateLoanFinancials = (loan, transactions) => {
 
   let interestPaidOnCurrentBuckets = 0;
   let lastInterestPaymentDate = null; 
-
-  // --- Helper: Reduce Principal (Common for Waterfall & Direct) ---
-  const reducePrincipal = (amountToReduce, date, label) => {
-      // 1. Lock unpaid interest on current principal before destroying it
-      const unpaidOnCurrent = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
-      if (unpaidOnCurrent > 0) {
-          lockedInterest += unpaidOnCurrent;
-          breakdown.push({
-            label: `Interest Arrears (Locked)`,
-            date: date.toISOString(),
-            amount: 0, 
-            interest: unpaidOnCurrent.toFixed(2),
-            status: 'accrued',
-            isCarryForward: true
-          });
-      }
-
-      // 2. Reset Current Interest Trackers
-      accruedInterestSnapshot = 0;
-      interestPaidOnCurrentBuckets = 0;
-
-      // 3. Reduce Principal
-      const totalActivePrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
-      const newPrincipalBalance = totalActivePrincipal - amountToReduce;
-
-      totalPrincipalPaid += amountToReduce;
-
-      if (newPrincipalBalance <= 0.5) { 
-         activePrincipals = [];
-      } else {
-         // --- FIX: Start new balance from TODAY (Payment Date), not Next Month ---
-         const freshStartDate = new Date(date); 
-         activePrincipals = [{
-           amount: newPrincipalBalance,
-           startDate: freshStartDate, 
-           label: "Balance c/f"
-         }];
-      }
-      
-      breakdown.push({
-        label: label,
-        amount: (-amountToReduce).toFixed(2),
-        date: date.toISOString(),
-        status: 'payment'
-      });
-  };
 
   for (let i = 0; i < processedEvents.length; i++) {
     const event = processedEvents[i];
@@ -278,8 +223,8 @@ const calculateLoanFinancials = (loan, transactions) => {
         });
     }
 
-    // 2. Calculate Accrued Interest
-    if (event.waterfallPay > 0 || event.principalPay > 0 || event.isReport || event.discount > 0 || event.disburse > 0) {
+    // 2. Handle Calculations (Accrual)
+    if (event.payment > 0 || event.isReport || event.discount > 0 || event.disburse > 0) {
       let currentSnapshot = 0;
       let currentRows = []; 
 
@@ -287,20 +232,21 @@ const calculateLoanFinancials = (loan, transactions) => {
         const isNewChunk = p.startDate.getTime() >= evtDate.getTime();
         
         if (!isNewChunk || event.isReport) {
+          // Use the strict 15-day logic
           let factor = calculateGoldLoanMonths(p.startDate, evtDate);
-          
+
           const interest = p.amount * rate * factor;
           currentSnapshot += interest;
           
+          // Only show rows if something is happening (Payment, Report, or Discount)
           if (interest > 0 || event.isReport) {
-             if (event.waterfallPay > 0 || event.principalPay > 0 || event.isReport) {
+             if (event.payment > 0 || event.isReport || event.discount > 0) {
                  currentRows.push({
                    label: `Int. on ${p.amount} (${p.label})`,
-                   date: p.startDate.toISOString(), // Shows Exact Start Date
+                   date: p.startDate.toISOString(),
                    endDate: evtDate.toISOString(),
                    amount: p.amount,
                    grossInterest: interest,
-                   months: factor, // Explicitly list Months Factor
                    rate: rate,
                    status: 'accrued'
                  });
@@ -309,12 +255,14 @@ const calculateLoanFinancials = (loan, transactions) => {
         }
       });
 
-      if (event.waterfallPay > 0 || event.principalPay > 0 || event.isReport) {
+      // Update the snapshot for payment/discount processing
+      if (event.payment > 0 || event.isReport || event.discount > 0) {
           accruedInterestSnapshot = currentSnapshot;
       }
 
-      // --- GENERATE BREAKDOWN ROWS ---
-      if (event.waterfallPay > 0 || event.principalPay > 0 || event.isReport) {
+      // --- GENERATE ACCRUAL BREAKDOWN ROWS ---
+      // We push accrual rows if there is activity
+      if (event.payment > 0 || event.isReport || event.discount > 0) {
           if (event.isReport && interestPaidOnCurrentBuckets > 0) {
               let paidRemaining = interestPaidOnCurrentBuckets;
               currentRows.forEach(row => {
@@ -322,13 +270,25 @@ const calculateLoanFinancials = (loan, transactions) => {
                       const deduction = Math.min(row.grossInterest, paidRemaining);
                       row.grossInterest -= deduction;
                       paidRemaining -= deduction;
+                      
+                      if (lastInterestPaymentDate) {
+                          if (new Date(row.date) < lastInterestPaymentDate) {
+                              row.date = lastInterestPaymentDate.toISOString();
+                          }
+                      }
                   }
+                  
+                  const netMonths = row.grossInterest / (row.amount * row.rate);
+                  row.months = netMonths;
                   row.interest = row.grossInterest.toFixed(2);
                   row.amount = row.amount.toFixed(2);
+                  
                   if (row.grossInterest > 0) breakdown.push(row);
               });
           } else {
               currentRows.forEach(row => {
+                  const netMonths = row.grossInterest / (row.amount * row.rate);
+                  row.months = netMonths;
                   row.interest = row.grossInterest.toFixed(2);
                   row.amount = row.amount.toFixed(2);
                   breakdown.push(row);
@@ -336,60 +296,91 @@ const calculateLoanFinancials = (loan, transactions) => {
           }
       }
 
-      // 3. Process Payments
-
-      // A. Waterfall (Interest -> Principal)
-      if (event.waterfallPay > 0) {
-        let paymentAmount = event.waterfallPay;
-        
-        // Pay Locked First
-        if (lockedInterest > 0) {
-            const paidLocked = Math.min(paymentAmount, lockedInterest);
-            lockedInterest -= paidLocked;
-            totalInterestPaid += paidLocked;
-            paymentAmount -= paidLocked;
-        }
-
-        // Pay Current Accrued
-        if (paymentAmount > 0) {
-            const netInterestOwed = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
-            const interestCovered = Math.min(paymentAmount, netInterestOwed);
-            
-            totalInterestPaid += interestCovered;
-            interestPaidOnCurrentBuckets += interestCovered;
-            if (interestCovered > 0) lastInterestPaymentDate = evtDate;
-            paymentAmount -= interestCovered;
-        }
-
-        // Pay Principal
-        if (paymentAmount > 0) {
-            reducePrincipal(paymentAmount, evtDate, `Payment Received (Waterfall)`);
-        } else {
-             breakdown.push({
-                label: `Interest Payment`,
-                amount: (-event.waterfallPay).toFixed(2),
-                date: evtDate.toISOString(),
-                status: 'payment'
-              });
-        }
-      }
-
-      // B. Principal Only (Direct Reduction)
-      if (event.principalPay > 0) {
-          reducePrincipal(event.principalPay, evtDate, `Principal Repayment (Direct)`);
-      }
-      
+      // 3. Apply Discount (NEW LOGIC)
       if (event.discount > 0) {
          totalDiscount += event.discount;
+
+         // Discount "pays" the interest first (Waiver)
+         const netInterestOwed = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
+         const discountCoveringInterest = Math.min(event.discount, netInterestOwed);
+         
+         if (discountCoveringInterest > 0) {
+             interestPaidOnCurrentBuckets += discountCoveringInterest;
+         }
+
+         breakdown.push({
+            label: `Discount Applied`,
+            amount: (-event.discount).toFixed(2),
+            date: evtDate.toISOString(),
+            status: 'payment' // Green styling
+         });
+      }
+
+      // 4. Apply Payment
+      if (event.payment > 0) {
+        let paymentAmount = event.payment;
+        
+        // Calculate remaining interest after discount
+        const netInterestOwed = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
+        const interestCovered = Math.min(paymentAmount, netInterestOwed);
+        
+        totalInterestPaid += interestCovered;
+        interestPaidOnCurrentBuckets += interestCovered;
+        
+        if (interestCovered > 0) {
+            lastInterestPaymentDate = evtDate; 
+        }
+
+        paymentAmount -= interestCovered;
+        
+        if (paymentAmount > 0) {
+          totalPrincipalPaid += paymentAmount;
+          
+          const totalActivePrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
+          const newPrincipalBalance = totalActivePrincipal - paymentAmount;
+
+          if (newPrincipalBalance <= 0.5) { 
+             activePrincipals = [];
+             accruedInterestSnapshot = 0;
+             interestPaidOnCurrentBuckets = 0;
+             lastInterestPaymentDate = null; 
+          } else {
+             const nextMonthDate = addOneMonth(evtDate);
+             activePrincipals = [{
+               amount: newPrincipalBalance,
+               startDate: nextMonthDate,
+               label: "Balance c/f"
+             }];
+             interestPaidOnCurrentBuckets = 0; 
+             accruedInterestSnapshot = 0;
+             lastInterestPaymentDate = null; 
+          }
+        }
+        
+        breakdown.push({
+          label: `Payment Received (${Array.from(event.types).join('+')})`,
+          amount: (-event.payment).toFixed(2),
+          date: evtDate.toISOString(),
+          status: 'payment'
+        });
       }
     }
   }
 
   const currentPrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
   
-  // Total Outstanding = Locked Interest + Remaining Current Interest
-  const currentUnpaid = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
-  const finalOutstandingInterest = lockedInterest + currentUnpaid;
+  // Recalculate final interest outstanding
+  const lastEvent = processedEvents[processedEvents.length-1];
+  let finalOutstandingInterest = 0;
+  
+  if (lastEvent.payment > 0 || lastEvent.discount > 0) {
+      // If we just paid or discounted, the snapshot is current.
+      // Subtract what has been covered (by cash or discount)
+      finalOutstandingInterest = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
+  } else {
+      finalOutstandingInterest = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
+  }
+
   const amountDue = currentPrincipal + finalOutstandingInterest;
 
   return {
