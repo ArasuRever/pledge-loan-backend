@@ -9,7 +9,6 @@ require('dotenv').config();
 
 const app = express();
 
-// --- 1. CONFIGURE CORS FOR PRODUCTION ---
 const allowedOrigins = [
   'http://localhost:3000', 
   'https://pledge-loan-frontend.onrender.com',
@@ -33,18 +32,13 @@ const JWT_SECRET = process.env.JWT_SECRET || 'a-very-strong-secret-key-that-you-
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// --- AUTHENTICATION MIDDLEWARE ---
+// --- MIDDLEWARE ---
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-
   if (token == null) return res.sendStatus(401);
-
   jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      console.error("JWT Verification Error:", err.message);
-      return res.sendStatus(403);
-    }
+    if (err) return res.sendStatus(403);
     req.user = user; 
     next();
   });
@@ -56,235 +50,306 @@ const authorizeAdmin = (req, res, next) => {
 };
 
 const authorizeManagement = (req, res, next) => {
-  if (['admin', 'manager'].includes(req.user.role)) {
-    next();
-  } else {
-    return res.sendStatus(403);
-  }
+  if (['admin', 'manager'].includes(req.user.role)) next();
+  else return res.sendStatus(403);
 };
 
-// --- HELPER: GET TARGET BRANCH ID ---
 const getTargetBranchId = (req) => {
   const { role, branchId: userBranchId } = req.user;
   const { branchId: queryBranchId } = req.query;
-
   if (role === 'admin') {
-    if (queryBranchId && queryBranchId !== 'all') {
-      return parseInt(queryBranchId);
-    }
+    if (queryBranchId && queryBranchId !== 'all') return parseInt(queryBranchId);
     return null; 
-  } else {
-    return userBranchId;
-  }
+  } else return userBranchId;
 };
 
-// =================================================================
-// 🆕 NEW LOGIC: MONTH CALCULATION (1 Day = 0.5, >15 Days = 1.0)
-// =================================================================
-const calculateGoldLoanMonths = (pledgeDateStr, currentDateStr) => {
-  const pledgeDate = new Date(pledgeDateStr);
-  const current = new Date(currentDateStr);
+// ==========================================
+// 🧠 CORE CALCULATION ENGINE (FIXED)
+// ==========================================
 
-  // 1. Calculate full months passed
-  let months = (current.getFullYear() - pledgeDate.getFullYear()) * 12;
-  months -= pledgeDate.getMonth();
-  months += current.getMonth();
-
-  // 2. Adjust for specific day
-  const pledgeDay = pledgeDate.getDate();
-  const currentDay = current.getDate();
-  
-  let dayDifference = currentDay - pledgeDay;
-
-  // If current day is before pledge day in the month, we haven't completed the cycle
-  if (dayDifference < 0) {
-    months--;
-    dayDifference += 30; // Approx adjustment
-  }
-
-  // --- RULE IMPLEMENTATION ---
-  if (months < 0) return 1; // Minimum 1 month safety
-  
-  let totalDuration = months;
-
-  // Partial Month Logic
-  if (dayDifference > 0) {
-    if (dayDifference <= 15) {
-      totalDuration += 0.5; // 1-15 days extra = 0.5 month
-    } else {
-      totalDuration += 1.0; // >15 days extra = 1.0 month
-    }
-  }
-
-  // Final check: Minimum duration is always 1 month
-  return totalDuration < 1 ? 1 : totalDuration;
+const parseDate = (dateInput) => {
+  const d = new Date(dateInput);
+  // Force local start of day to prevent UTC rollback
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
 };
 
-// =================================================================
-// 🆕 NEW LOGIC: BUCKET FINANCIAL CALCULATOR (Initial vs Top-up)
-// =================================================================
+const calculateGoldLoanMonths = (startDate, endDate) => {
+  const start = parseDate(startDate);
+  const end = parseDate(endDate);
+  
+  if (end <= start) return 0.0;
+
+  let months = (end.getFullYear() - start.getFullYear()) * 12;
+  months -= start.getMonth();
+  months += end.getMonth();
+
+  if (end.getDate() > start.getDate()) {
+    return months + 0.5;
+  }
+  return months > 0 ? months : 0.0;
+};
+
+const addOneMonth = (dateObj) => {
+  const d = parseDate(dateObj);
+  d.setMonth(d.getMonth() + 1);
+  return d;
+};
+
 const calculateLoanFinancials = (loan, transactions) => {
-    // 1. Separate Transactions
-    const disbursements = transactions.filter(t => t.payment_type === 'disbursement');
-    const payments = transactions.filter(t => t.payment_type !== 'disbursement' && t.payment_type !== 'discount');
-    const discountTx = transactions.filter(t => t.payment_type === 'discount');
+  const rate = parseFloat(loan.interest_rate) / 100;
+  const today = new Date();
+  const endDate = loan.status === 'paid' && loan.closed_date ? new Date(loan.closed_date) : today;
 
-    const pledgeDate = new Date(loan.pledge_date);
-    const today = new Date(); // Or closed_date if loan is paid
-    const endDate = loan.status === 'paid' && loan.closed_date ? new Date(loan.closed_date) : today;
+  let rawEvents = [];
 
-    // 2. Build Principal Buckets (Initial vs Top-ups)
-    // Logic: Initial Principal = Current DB Principal - Sum of TopUp Disbursements
-    // A TopUp is any disbursement NOT in the same month/year as Pledge Date
-    
-    let topUpSum = 0;
-    const buckets = [];
-    const breakdown = []; // For UI Display
+  // A. Initial Principal
+  const disbursements = transactions.filter(t => t.payment_type === 'disbursement');
+  const topUpSum = disbursements.reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
+  const initialPrincipal = parseFloat(loan.principal_amount) - topUpSum;
 
-    disbursements.forEach(tx => {
-       const txDate = new Date(tx.payment_date);
-       const isSameMonth = (txDate.getMonth() === pledgeDate.getMonth()) && (txDate.getFullYear() === pledgeDate.getFullYear());
-
-       if (!isSameMonth) {
-           // This is a Top Up
-           const amount = parseFloat(tx.amount_paid);
-           topUpSum += amount;
-           
-           const duration = calculateGoldLoanMonths(txDate, endDate);
-           const interest = (amount * parseFloat(loan.interest_rate) * duration) / 100;
-           
-           buckets.push({ type: 'addon', amount, interest });
-           breakdown.push({
-               label: `Top-up (${txDate.toLocaleDateString('en-IN')})`,
-               amount: amount.toString(),
-               date: txDate.toISOString(),
-               endDate: endDate.toISOString(),
-               months: duration,
-               interest: interest.toFixed(2)
-           });
-       }
+  if (initialPrincipal > 0) {
+    rawEvents.push({ 
+      type: 'disburse', 
+      date: new Date(loan.pledge_date), 
+      amount: initialPrincipal,
+      isInitial: true
     });
+  }
 
-    const currentPrincipalTotal = parseFloat(loan.principal_amount);
-    const initialPrincipalAmount = currentPrincipalTotal - topUpSum;
+  // B. Transactions
+  transactions.forEach(t => {
+    const d = new Date(t.payment_date);
+    const amt = parseFloat(t.amount_paid);
+    
+    if (t.payment_type === 'disbursement') {
+      rawEvents.push({ type: 'disburse', date: d, amount: amt });
+    } else if (['interest', 'principal', 'settlement'].includes(t.payment_type)) {
+      rawEvents.push({ type: 'payment', date: d, amount: amt, originalType: t.payment_type });
+    } else if (t.payment_type === 'discount') {
+      rawEvents.push({ type: 'discount', date: d, amount: amt });
+    }
+  });
 
-    if (initialPrincipalAmount > 0) {
-        const duration = calculateGoldLoanMonths(pledgeDate, endDate);
-        const interest = (initialPrincipalAmount * parseFloat(loan.interest_rate) * duration) / 100;
-        
-        buckets.push({ type: 'initial', amount: initialPrincipalAmount, interest });
-        // Add to start of breakdown
-        breakdown.unshift({
-            label: "Initial Principal",
-            amount: initialPrincipalAmount.toString(),
-            date: pledgeDate.toISOString(),
-            endDate: endDate.toISOString(),
-            months: duration,
-            interest: interest.toFixed(2)
+  // C. Group Events by Date
+  const eventsMap = new Map();
+
+  rawEvents.forEach(ev => {
+    const dateKey = parseDate(ev.date).getTime();
+    
+    if (!eventsMap.has(dateKey)) {
+        eventsMap.set(dateKey, {
+            date: parseDate(ev.date),
+            disburse: 0,
+            payment: 0,
+            discount: 0,
+            types: new Set(),
+            topupDetails: [] 
+        });
+    }
+    const group = eventsMap.get(dateKey);
+    
+    if (ev.type === 'disburse') {
+        group.disburse += ev.amount;
+        group.topupDetails.push({ amount: ev.amount, isInitial: ev.isInitial });
+    } else if (ev.type === 'payment') {
+        group.payment += ev.amount;
+        group.types.add(ev.originalType);
+    } else if (ev.type === 'discount') {
+        group.discount += ev.amount;
+    }
+  });
+
+  const processedEvents = Array.from(eventsMap.values()).sort((a, b) => a.date - b.date);
+
+  // Add Final Report Event
+  processedEvents.push({ 
+      date: parseDate(endDate), 
+      isReport: true,
+      disburse: 0, payment: 0, discount: 0, types: new Set(), topupDetails: []
+  });
+
+  // --- CALCULATION LOOP ---
+  let activePrincipals = []; 
+  let accruedInterestSnapshot = 0; 
+  
+  let totalPrincipalPaid = 0;
+  let totalInterestPaid = 0;
+  let totalDiscount = 0;
+  let breakdown = [];
+
+  // Track interest paid on currently active buckets
+  let interestPaidOnCurrentBuckets = 0;
+
+  for (let i = 0; i < processedEvents.length; i++) {
+    const event = processedEvents[i];
+    const evtDate = event.date;
+
+    // 1. Handle New Disbursements
+    if (event.disburse > 0) {
+        event.topupDetails.forEach(detail => {
+            activePrincipals.push({ 
+                amount: detail.amount, 
+                startDate: evtDate, 
+                label: detail.isInitial ? "Initial Principal" : `Top-up`
+            });
         });
     }
 
-    // 3. Calculate Totals
-    const totalInterestAccrued = buckets.reduce((sum, b) => sum + b.interest, 0);
-    const totalPaid = payments.reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
-    const totalDiscount = discountTx.reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
+    // 2. Handle Payments or Report (Calculate Interest)
+    // We also trigger calculation if a disbursement happened, so we can see the "Top-up" row in the worksheet immediately
+    if (event.payment > 0 || event.isReport || event.discount > 0 || event.disburse > 0) {
+      let currentSnapshot = 0;
 
-    // 4. Waterfall (Interest First)
-    let remainingPayment = totalPaid + totalDiscount;
-    let interestPaid = 0;
-    let principalPaid = 0;
+      activePrincipals.forEach((p) => {
+        // Only calc interest if this chunk existed BEFORE today's event, OR if it's the Final Report
+        // (This ensures newly added Top-ups get calculated in the final report)
+        const isNewChunk = p.startDate.getTime() >= evtDate.getTime();
+        
+        // ALLOW calculation for new chunks ONLY if it is the Final Report (to show 1 month accrued)
+        if (!isNewChunk || event.isReport) {
+          let factor = calculateGoldLoanMonths(p.startDate, evtDate);
+          
+          // --- THE FIX: NEW MONEY RULES ---
+          // If it's NOT a "Balance c/f" (meaning it's New Money) AND calculated factor is 0...
+          // Force it to 1.0 (Full Month Interest)
+          if (p.label !== "Balance c/f" && factor === 0) {
+              factor = 1.0;
+          }
 
-    if (remainingPayment >= totalInterestAccrued) {
-        interestPaid = totalInterestAccrued;
-        remainingPayment -= totalInterestAccrued;
-        principalPaid = remainingPayment; 
-    } else {
-        interestPaid = remainingPayment;
-        principalPaid = 0;
+          const interest = p.amount * rate * factor;
+          currentSnapshot += interest;
+          
+          // Show row if interest > 0 OR if it's the Final Report (so we see the active loan status)
+          if (interest > 0 || event.isReport) {
+             // Avoid adding duplicate rows for the same date/amount if multiple events happen
+             // We only add to breakdown if it's a Report or a Payment event (not just a disburse event loop)
+             if (event.payment > 0 || event.isReport) {
+                 breakdown.push({
+                   label: `Int. on ${p.amount} (${p.label})`,
+                   date: p.startDate.toISOString(),
+                   endDate: evtDate.toISOString(),
+                   amount: p.amount.toFixed(2),
+                   months: factor,
+                   interest: interest.toFixed(2),
+                   status: 'accrued'
+                 });
+             }
+          }
+        }
+      });
+
+      // Update global snapshot (only if meaningful change, but logic dictates we update)
+      // Note: If we are just processing a disbursement loop, we don't update the MAIN accrued variable used for payments
+      if (event.payment > 0 || event.isReport) {
+          accruedInterestSnapshot = currentSnapshot;
+      }
+
+      // 3. Apply Payment
+      if (event.payment > 0) {
+        let paymentAmount = event.payment;
+        
+        // Pay Interest First
+        const netInterestOwed = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
+        const interestCovered = Math.min(paymentAmount, netInterestOwed);
+        
+        totalInterestPaid += interestCovered;
+        interestPaidOnCurrentBuckets += interestCovered;
+        paymentAmount -= interestCovered;
+        
+        // Pay Principal Next
+        if (paymentAmount > 0) {
+          totalPrincipalPaid += paymentAmount;
+          
+          const totalActivePrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
+          const newPrincipalBalance = totalActivePrincipal - paymentAmount;
+
+          if (newPrincipalBalance <= 0.5) { 
+             activePrincipals = [];
+             accruedInterestSnapshot = 0;
+             interestPaidOnCurrentBuckets = 0;
+          } else {
+             // RESET RULE: Defer remaining balance to next month
+             const nextMonthDate = addOneMonth(evtDate);
+             activePrincipals = [{
+               amount: newPrincipalBalance,
+               startDate: nextMonthDate,
+               label: "Balance c/f"
+             }];
+             // Reset interest tracking for the new bucket
+             interestPaidOnCurrentBuckets = 0;
+             // Reset snapshot because we have a new start date
+             accruedInterestSnapshot = 0; 
+          }
+        }
+        
+        breakdown.push({
+          label: `Payment Received (${Array.from(event.types).join('+')})`,
+          amount: (-event.payment).toFixed(2),
+          date: evtDate.toISOString(),
+          status: 'payment'
+        });
+      }
+      
+      if (event.discount > 0) {
+         totalDiscount += event.discount;
+      }
     }
+  }
 
-    const outstandingPrincipal = currentPrincipalTotal - principalPaid;
-    const outstandingInterest = totalInterestAccrued - interestPaid;
-    const amountDue = outstandingPrincipal + outstandingInterest;
+  const currentPrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
+  
+  // Final Interest Calc
+  let finalOutstandingInterest = accruedInterestSnapshot;
+  const lastEvent = processedEvents[processedEvents.length-1];
+  
+  if (lastEvent.payment > 0) {
+      const interestCoveredInLastStep = Math.min(lastEvent.payment, accruedInterestSnapshot);
+      finalOutstandingInterest = accruedInterestSnapshot - interestCoveredInLastStep;
+  } else {
+      finalOutstandingInterest = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
+  }
 
-    return {
-        totalInterestOwed: totalInterestAccrued.toFixed(2), // Total generated
-        principalPaid: principalPaid.toFixed(2),
-        interestPaid: interestPaid.toFixed(2),
-        totalPaid: totalPaid.toFixed(2),
-        outstandingPrincipal: outstandingPrincipal > 0 ? outstandingPrincipal.toFixed(2) : "0.00",
-        outstandingInterest: outstandingInterest > 0 ? outstandingInterest.toFixed(2) : "0.00",
-        amountDue: amountDue > 0 ? amountDue.toFixed(2) : "0.00",
-        breakdown: breakdown // Compatible with UI
-    };
+  const amountDue = currentPrincipal + finalOutstandingInterest;
+
+  return {
+    totalInterestOwed: (totalInterestPaid + finalOutstandingInterest).toFixed(2),
+    principalPaid: totalPrincipalPaid.toFixed(2),
+    interestPaid: totalInterestPaid.toFixed(2),
+    totalPaid: (totalPrincipalPaid + totalInterestPaid + totalDiscount).toFixed(2),
+    outstandingPrincipal: currentPrincipal.toFixed(2),
+    outstandingInterest: finalOutstandingInterest.toFixed(2),
+    amountDue: amountDue.toFixed(2),
+    breakdown: breakdown.reverse()
+  };
 };
-// =================================================================
+
+// --- AUTH & USER ROUTES ---
 
 app.get('/', async (req, res) => {
   try {
     const { rows } = await db.query('SELECT NOW()');
     res.status(200).json({ message: "Welcome to Pledge Loan API", db_status: "Connected", db_time: rows[0].now });
-  } catch (err) {
-    res.status(500).json({ message: "DB connection failed.", db_status: "Error" });
-  }
+  } catch (err) { res.status(500).json({ message: "DB Error" }); }
 });
 
-// --- AUTHENTICATION ROUTES ---
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-    if (!username || !password) return res.status(400).send('Username and password are required.');
-    
-    // Fetch user details + Branch Name
-    const query = `
-      SELECT u.*, b.branch_name 
-      FROM users u 
-      LEFT JOIN branches b ON u.branch_id = b.id 
-      WHERE u.username = $1
-    `;
+    if (!username || !password) return res.status(400).send('Required');
+    const query = `SELECT u.*, b.branch_name FROM users u LEFT JOIN branches b ON u.branch_id = b.id WHERE u.username = $1`;
     const userResult = await db.query(query, [username]);
-    
-    if (userResult.rows.length === 0) return res.status(401).send('Invalid credentials.');
+    if (userResult.rows.length === 0) return res.status(401).send('Invalid');
     const user = userResult.rows[0];
-    
     const validPassword = await bcrypt.compare(password, user.password); 
-    if (!validPassword) return res.status(401).send('Invalid credentials.');
-    
-    // INCLUDE branch_id in the token payload
-    const tokenPayload = { 
-      userId: user.id, 
-      username: user.username, 
-      role: user.role,
-      branchId: user.branch_id 
-    };
-
-    const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '30d' });
-    
-    res.json({ 
-      token: token, 
-      user: { 
-        id: user.id, 
-        username: user.username, 
-        role: user.role,
-        branchId: user.branch_id,
-        branchName: user.branch_name || 'Main Branch'
-      } 
-    });
-  } catch (err) { 
-    console.error("Login Error:", err);
-    res.status(500).send('Server error during login.'); 
-  }
+    if (!validPassword) return res.status(401).send('Invalid');
+    const token = jwt.sign({ userId: user.id, username: user.username, role: user.role, branchId: user.branch_id }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, user: { id: user.id, username: user.username, role: user.role, branchId: user.branch_id, branchName: user.branch_name || 'Main' } });
+  } catch (err) { res.status(500).send('Error'); }
 });
 
-// --- USER MANAGEMENT (ADMIN ONLY) ---
 app.get('/api/users', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
-    const users = await db.query(`
-      SELECT u.id, u.username, u.role, u.branch_id, b.branch_name 
-      FROM users u 
-      LEFT JOIN branches b ON u.branch_id = b.id 
-      ORDER BY u.id ASC
-    `);
+    const users = await db.query(`SELECT u.id, u.username, u.role, u.branch_id, b.branch_name FROM users u LEFT JOIN branches b ON u.branch_id = b.id ORDER BY u.id ASC`);
     res.json(users.rows);
   } catch (err) { res.status(500).send("Server Error"); }
 });
@@ -292,120 +357,71 @@ app.get('/api/users', authenticateToken, authorizeAdmin, async (req, res) => {
 app.post('/api/users/create', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const { username, password, role, branchId } = req.body; 
-    
-    if (!username || !password) return res.status(400).send('Username and password are required.');
-    
+    if (!username || !password) return res.status(400).send('Required');
     const validRoles = ['admin', 'manager', 'staff'];
     const assignedRole = validRoles.includes(role) ? role : 'staff';
     const assignedBranch = branchId || 1; 
-
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-    
-    const newUser = await db.query(
-        "INSERT INTO users (username, password, role, branch_id) VALUES ($1, $2, $3, $4) RETURNING id, username, role, branch_id", 
-        [username, hashedPassword, assignedRole, assignedBranch]
-    );
+    const newUser = await db.query("INSERT INTO users (username, password, role, branch_id) VALUES ($1, $2, $3, $4) RETURNING id, username, role, branch_id", [username, hashedPassword, assignedRole, assignedBranch]);
     res.status(201).json(newUser.rows[0]);
   } catch (err) {
-    if (err.code === '23505') return res.status(400).send('Username already exists.');
-    console.error("Create User Error:", err);
-    res.status(500).send('Server error during user creation.');
+    if (err.code === '23505') return res.status(400).send('Username exists.');
+    res.status(500).send('Error');
   }
 });
 
-// Update User Details (Role, Branch, Username)
 app.put('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { username, role, branchId } = req.body;
-    
-    // 1. Check if user exists
     const check = await db.query("SELECT * FROM users WHERE id = $1", [id]);
-    if (check.rows.length === 0) return res.status(404).json({ error: "User not found" });
-
-    // 2. Prepare Update
-    // Use existing values if not provided
+    if (check.rows.length === 0) return res.status(404).json({ error: "Not found" });
     const oldUser = check.rows[0];
     const newUsername = username || oldUser.username;
     const newRole = role || oldUser.role;
     const newBranchId = (branchId !== undefined) ? branchId : oldUser.branch_id;
-
-    // 3. Update Query
-    const result = await db.query(
-      "UPDATE users SET username = $1, role = $2, branch_id = $3 WHERE id = $4 RETURNING id, username, role, branch_id",
-      [newUsername, newRole, newBranchId, id]
-    );
-
+    const result = await db.query("UPDATE users SET username = $1, role = $2, branch_id = $3 WHERE id = $4 RETURNING id, username, role, branch_id", [newUsername, newRole, newBranchId, id]);
     res.json(result.rows[0]);
-  } catch (err) {
-    console.error("Update User Error:", err);
-    res.status(500).send("Server Error");
-  }
+  } catch (err) { res.status(500).send("Error"); }
 });
 
 app.put('/api/users/change-password', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const { userId, newPassword } = req.body;
-    if (!userId || !newPassword) return res.status(400).send('User ID and new password are required.');
+    if (!userId || !newPassword) return res.status(400).send('Required');
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(newPassword, salt);
     const result = await db.query("UPDATE users SET password = $1 WHERE id = $2 RETURNING id, username", [hashedPassword, userId]);
-    if (result.rows.length === 0) return res.status(404).send('User not found.');
-    res.status(200).json({ message: `Password for ${result.rows[0].username} updated successfully.` });
-  } catch (err) { res.status(500).send('Server error changing password.'); }
+    if (result.rows.length === 0) return res.status(404).send('Not found.');
+    res.status(200).json({ message: `Password updated.` });
+  } catch (err) { res.status(500).send('Error'); }
 });
 
 app.delete('/api/users/:id', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const userId = parseInt(id);
-    if (isNaN(userId)) return res.status(400).send('Invalid user ID.');
-    if (userId === req.user.userId) return res.status(400).send('You cannot delete your own account.');
-    
-    const result = await db.query("DELETE FROM users WHERE id = $1 RETURNING id, username, role", [userId]);
-    if (result.rows.length === 0) return res.status(404).send('User not found.');
-    
-    res.status(200).json({ message: `User ${result.rows[0].username} (${result.rows[0].role}) deleted successfully.` });
-  } catch (err) { res.status(500).send('Server error deleting user.'); }
+    if (userId === req.user.userId) return res.status(400).send('Cannot delete self.');
+    const result = await db.query("DELETE FROM users WHERE id = $1 RETURNING id, username", [userId]);
+    if (result.rows.length === 0) return res.status(404).send('Not found.');
+    res.status(200).json({ message: `User deleted.` });
+  } catch (err) { res.status(500).send('Error'); }
 });
 
-
 // --- CUSTOMERS ---
+
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
-    const targetBranch = getTargetBranchId(req); // null (All) or ID
+    const targetBranch = getTargetBranchId(req);
+    if (targetBranch) await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active' AND branch_id = $1", [targetBranch]);
+    else await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
 
-    // Update overdue status efficiently (scoped)
-    if (targetBranch) {
-       await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active' AND branch_id = $1", [targetBranch]);
-    } else {
-       await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
-    }
-
-    let query = `
-        SELECT 
-          c.id, c.name, c.phone_number, c.address, c.customer_image_url, c.branch_id, b.branch_name,
-          COUNT(CASE WHEN l.status = 'active' THEN 1 END)::int AS active_loan_count,
-          COUNT(CASE WHEN l.status = 'overdue' THEN 1 END)::int AS overdue_loan_count,
-          COUNT(CASE WHEN l.status = 'paid' THEN 1 END)::int AS paid_loan_count
-        FROM Customers c
-        LEFT JOIN Loans l ON c.id = l.customer_id AND l.status != 'deleted'
-        LEFT JOIN Branches b ON c.branch_id = b.id
-        LEFT JOIN Branches b2 ON l.branch_id = b2.id
-        WHERE c.is_deleted = false
-    `;
-
+    let query = `SELECT c.id, c.name, c.phone_number, c.address, c.customer_image_url, c.branch_id, b.branch_name, COUNT(CASE WHEN l.status = 'active' THEN 1 END)::int AS active_loan_count, COUNT(CASE WHEN l.status = 'overdue' THEN 1 END)::int AS overdue_loan_count, COUNT(CASE WHEN l.status = 'paid' THEN 1 END)::int AS paid_loan_count FROM Customers c LEFT JOIN Loans l ON c.id = l.customer_id AND l.status != 'deleted' LEFT JOIN Branches b ON c.branch_id = b.id WHERE c.is_deleted = false`;
     const params = [];
-    if (targetBranch) {
-        query += ` AND c.branch_id = $1`;
-        params.push(targetBranch);
-    }
-
+    if (targetBranch) { query += ` AND c.branch_id = $1`; params.push(targetBranch); }
     query += ` GROUP BY c.id, b.branch_name ORDER BY c.name ASC`;
-    
     const result = await db.query(query, params);
-    
     const customers = result.rows.map(c => {
         if (c.customer_image_url) {
             const b64 = c.customer_image_url.toString('base64');
@@ -414,200 +430,95 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
         }
         return c;
     });
-
     res.json(customers);
-  } catch (err) { 
-    console.error("Get Customers Error:", err);
-    res.status(500).send("Server Error"); 
-  }
+  } catch (err) { res.status(500).send("Error"); }
 });
 
 app.get('/api/customers/:id', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
-    
-    // FIX: Join Branches to get branch_name
-    const query = `
-        SELECT c.*, b.branch_name 
-        FROM Customers c 
-        LEFT JOIN Branches b ON c.branch_id = b.id 
-        WHERE c.id = $1 AND c.is_deleted = false
-    `;
-    
+    const query = `SELECT c.*, b.branch_name FROM Customers c LEFT JOIN Branches b ON c.branch_id = b.id WHERE c.id = $1 AND c.is_deleted = false`;
     const customerResult = await db.query(query, [id]);
-    if (customerResult.rows.length === 0) return res.status(404).json({ error: "Customer not found." });
-    
+    if (customerResult.rows.length === 0) return res.status(404).json({ error: "Not found." });
     const customer = customerResult.rows[0];
-
-    // FIX: Strict Integer Comparison
     const userRole = req.user.role;
     const userBranchId = parseInt(req.user.branchId || 0);
     const customerBranchId = parseInt(customer.branch_id || 0);
-
-    if (userRole !== 'admin' && customerBranchId !== userBranchId) {
-        return res.status(403).json({ error: "Access Denied. Customer belongs to another branch." });
-    }
-
+    if (userRole !== 'admin' && customerBranchId !== userBranchId) return res.status(403).json({ error: "Access Denied." });
     if (customer.customer_image_url) {
       const b64 = customer.customer_image_url.toString('base64');
       let mimeType = b64.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
       customer.customer_image_url = `data:${mimeType};base64,${b64}`;
     }
     res.json(customer);
-  } catch (err) { 
-    console.error("Get Customer Details Error:", err);
-    res.status(500).send("Server Error"); 
-  }
+  } catch (err) { res.status(500).send("Error"); }
 });
 
 app.post('/api/customers', authenticateToken, upload.single('photo'), async (req, res) => {
   try {
     const { name, phone_number, address, id_proof_type, id_proof_number, nominee_name, nominee_relation } = req.body;
     const imageBuffer = req.file ? req.file.buffer : null;
-    
-    if (!name || !phone_number) return res.status(400).json({ error: 'Name and phone are required.' });
-    
-    // Assign Branch: Admin can choose, others use their own
+    if (!name || !phone_number) return res.status(400).json({ error: 'Name/Phone required.' });
     let assignedBranch = req.user.branchId;
-    if (req.user.role === 'admin' && req.body.branchId) {
-        assignedBranch = parseInt(req.body.branchId);
-    }
-
-    const newCustomerResult = await db.query(
-      `INSERT INTO Customers 
-       (name, phone_number, address, id_proof_type, id_proof_number, nominee_name, nominee_relation, customer_image_url, is_deleted, branch_id) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9) 
-       RETURNING *`,
-      [name, phone_number, address, id_proof_type, id_proof_number, nominee_name, nominee_relation, imageBuffer, assignedBranch || 1]
-    );
+    if (req.user.role === 'admin' && req.body.branchId) assignedBranch = parseInt(req.body.branchId);
+    const newCustomerResult = await db.query(`INSERT INTO Customers (name, phone_number, address, id_proof_type, id_proof_number, nominee_name, nominee_relation, customer_image_url, is_deleted, branch_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9) RETURNING *`, [name, phone_number, address, id_proof_type, id_proof_number, nominee_name, nominee_relation, imageBuffer, assignedBranch || 1]);
     res.status(201).json(newCustomerResult.rows[0]);
-  } catch (err) { 
-    console.error("Create Customer Error:", err);
-    res.status(500).send("Server Error"); 
-  }
+  } catch (err) { res.status(500).send("Error"); }
 });
 
 app.put('/api/customers/:id', authenticateToken, upload.single('photo'), async (req, res) => {
     try {
         const id = parseInt(req.params.id);
-        if (isNaN(id)) return res.status(400).json({ error: "Invalid ID." });
-
-        // Branch check
         const checkBranch = await db.query("SELECT branch_id FROM Customers WHERE id = $1", [id]);
-        if (checkBranch.rows.length === 0) return res.status(404).json({ error: "Customer not found." });
-        
-        if (req.user.role !== 'admin' && checkBranch.rows[0].branch_id !== req.user.branchId) {
-            return res.status(403).json({ error: "Access Denied. You can only edit customers in your branch." });
-        }
-        
+        if (checkBranch.rows.length === 0) return res.status(404).json({ error: "Not found." });
+        if (req.user.role !== 'admin' && checkBranch.rows[0].branch_id !== req.user.branchId) return res.status(403).json({ error: "Access Denied." });
         const { name, phone_number, address, id_proof_type, id_proof_number, nominee_name, nominee_relation } = req.body;
         let imageBuffer = null;
         let updateImage = false;
-        
         if (req.file) { imageBuffer = req.file.buffer; updateImage = true; }
         else if (req.body.removeCurrentImage === 'true') { imageBuffer = null; updateImage = true; }
-        
-        let query; let values;
+        let query, values;
         if (updateImage) {
-          query = `UPDATE Customers SET 
-                   name = $1, phone_number = $2, address = $3, 
-                   id_proof_type = $4, id_proof_number = $5, 
-                   nominee_name = $6, nominee_relation = $7,
-                   customer_image_url = $8 
-                   WHERE id = $9 AND is_deleted = false RETURNING *`;
+          query = `UPDATE Customers SET name = $1, phone_number = $2, address = $3, id_proof_type = $4, id_proof_number = $5, nominee_name = $6, nominee_relation = $7, customer_image_url = $8 WHERE id = $9 AND is_deleted = false RETURNING *`;
           values = [name, phone_number, address, id_proof_type, id_proof_number, nominee_name, nominee_relation, imageBuffer, id];
         } else {
-          query = `UPDATE Customers SET 
-                   name = $1, phone_number = $2, address = $3, 
-                   id_proof_type = $4, id_proof_number = $5, 
-                   nominee_name = $6, nominee_relation = $7
-                   WHERE id = $8 AND is_deleted = false RETURNING *`;
+          query = `UPDATE Customers SET name = $1, phone_number = $2, address = $3, id_proof_type = $4, id_proof_number = $5, nominee_name = $6, nominee_relation = $7 WHERE id = $8 AND is_deleted = false RETURNING *`;
           values = [name, phone_number, address, id_proof_type, id_proof_number, nominee_name, nominee_relation, id];
         }
         const updateCustomerResult = await db.query(query, values);
         res.json(updateCustomerResult.rows[0]);
-    } catch (err) { 
-        console.error("Update Customer Error:", err);
-        res.status(500).send("Server Error"); 
-    }
+    } catch (err) { res.status(500).send("Error"); }
 });
 
-// Admin AND Manager can delete (within branch)
 app.delete('/api/customers/:id', authenticateToken, authorizeManagement, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    if (isNaN(id)) return res.status(400).json({ error: "Invalid customer ID." });
-    
-    // Check branch ownership
     const cust = await db.query("SELECT branch_id FROM Customers WHERE id = $1", [id]);
     if (cust.rows.length === 0) return res.status(404).json({ error: "Not found." });
-
-    if (req.user.role !== 'admin' && cust.rows[0].branch_id !== req.user.branchId) {
-        return res.status(403).json({ error: "Access Denied." });
-    }
-
+    if (req.user.role !== 'admin' && cust.rows[0].branch_id !== req.user.branchId) return res.status(403).json({ error: "Access Denied." });
     const activeLoanCheck = await db.query("SELECT COUNT(*) FROM Loans WHERE customer_id = $1 AND status IN ('active', 'overdue')", [id]);
-    if (parseInt(activeLoanCheck.rows[0].count) > 0) return res.status(400).json({ error: "Cannot delete customer. They have active or overdue loans." });
-    
+    if (parseInt(activeLoanCheck.rows[0].count) > 0) return res.status(400).json({ error: "Active loans exist." });
     const deleteCustomerResult = await db.query("UPDATE Customers SET is_deleted = true WHERE id = $1 RETURNING id, name", [id]);
     await db.query("UPDATE Loans SET status = 'deleted' WHERE customer_id = $1 AND status IN ('paid', 'forfeited')", [id]);
-    
-    res.json({ message: `Customer '${deleteCustomerResult.rows[0].name}' and their closed loans have been moved to the recycle bin.` });
-  } catch (err) { res.status(500).send("Server Error"); }
+    res.json({ message: `Customer deleted.` });
+  } catch (err) { res.status(500).send("Error"); }
 });
 
-// --- LOANS ---
+// --- LOANS & TRANSACTIONS ---
+
 app.get('/api/loans', authenticateToken, async (req, res) => {
   try {
     const targetBranch = getTargetBranchId(req);
-
-    // Scoped update for overdue
-    if (targetBranch) {
-       await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active' AND branch_id = $1", [targetBranch]);
-    } else {
-       await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
-    }
-
-    let query = `
-        SELECT l.id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date, l.status,
-               c.name AS customer_name, c.phone_number, b.branch_name
-        FROM Loans l 
-        JOIN Customers c ON l.customer_id = c.id
-        LEFT JOIN Branches b ON l.branch_id = b.id
-        WHERE l.status IN ('active', 'overdue', 'paid', 'forfeited') AND c.is_deleted = false
-    `;
-    
+    if (targetBranch) await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active' AND branch_id = $1", [targetBranch]);
+    else await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
+    let query = `SELECT l.id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date, l.status, c.name AS customer_name, c.phone_number, b.branch_name FROM Loans l JOIN Customers c ON l.customer_id = c.id LEFT JOIN Branches b ON l.branch_id = b.id WHERE l.status IN ('active', 'overdue', 'paid', 'forfeited') AND c.is_deleted = false`;
     const params = [];
-    if (targetBranch) {
-        query += ` AND l.branch_id = $1`;
-        params.push(targetBranch);
-    }
-    
+    if (targetBranch) { query += ` AND l.branch_id = $1`; params.push(targetBranch); }
     query += ` ORDER BY l.pledge_date DESC`;
-
     const allLoans = await db.query(query, params);
     res.json(allLoans.rows);
-  } catch (err) { 
-    console.error("Get Loans Error:", err);
-    res.status(500).send("Server Error"); 
-  }
+  } catch (err) { res.status(500).send("Error"); }
 });
-
-// Recent/Overdue filters also need to respect branch
-const getScopedLoanQuery = (baseQuery, req) => {
-    const targetBranch = getTargetBranchId(req);
-    let q = baseQuery;
-    const params = [];
-    // Ensure baseQuery has WHERE clause or add it
-    const hasWhere = q.toUpperCase().includes("WHERE");
-    
-    if (targetBranch) {
-        q += hasWhere ? ` AND l.branch_id = $1` : ` WHERE l.branch_id = $1`;
-        params.push(targetBranch);
-    }
-    return { q, params };
-};
 
 app.get('/api/loans/recent/created', authenticateToken, async (req, res) => {
   try {
@@ -633,16 +544,9 @@ app.get('/api/loans/overdue', authenticateToken, async (req, res) => {
     if(targetBranch) await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active' AND branch_id = $1", [targetBranch]);
     else await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'");
     
-    let base = `
-      SELECT l.id, l.due_date, l.principal_amount, l.book_loan_number, l.pledge_date, 
-             c.name AS customer_name, c.phone_number, c.address 
-      FROM Loans l 
-      JOIN Customers c ON l.customer_id = c.id 
-      WHERE l.status = 'overdue' AND c.is_deleted = false`;
-    
+    let base = `SELECT l.id, l.due_date, l.principal_amount, l.book_loan_number, l.pledge_date, c.name AS customer_name, c.phone_number, c.address FROM Loans l JOIN Customers c ON l.customer_id = c.id WHERE l.status = 'overdue' AND c.is_deleted = false`;
     const { q, params } = getScopedLoanQuery(base, req);
     const finalQ = q + ` ORDER BY l.due_date ASC`;
-      
     const overdueLoans = await db.query(finalQ, params);
     res.json(overdueLoans.rows);
   } catch (err) { res.status(500).send("Server Error"); }
@@ -651,16 +555,10 @@ app.get('/api/loans/overdue', authenticateToken, async (req, res) => {
 app.get('/api/loans/find-by-book-number/:bookNumber', authenticateToken, async (req, res) => {
   try {
     const { bookNumber } = req.params;
-    // Check branch scope
     const targetBranch = getTargetBranchId(req);
     let query = "SELECT id FROM Loans WHERE book_loan_number = $1 AND status != 'deleted'";
     let params = [bookNumber];
-    
-    if (targetBranch) {
-        query += " AND branch_id = $2";
-        params.push(targetBranch);
-    }
-    
+    if (targetBranch) { query += " AND branch_id = $2"; params.push(targetBranch); }
     const result = await db.query(query, params);
     if (result.rows.length === 0) return res.status(404).json({ error: "No loan found." });
     res.json({ loanId: result.rows[0].id });
@@ -673,48 +571,38 @@ app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => 
   const loanId = parseInt(id);
   const amountToAdd = parseFloat(additionalAmount);
   const username = req.user.username; 
-  if (isNaN(loanId) || loanId <= 0) return res.status(400).json({ error: "Invalid loan ID." });
-  if (isNaN(amountToAdd) || amountToAdd <= 0) return res.status(400).json({ error: "Invalid additional amount." });
+  if (isNaN(loanId) || loanId <= 0) return res.status(400).json({ error: "Invalid ID." });
+  if (isNaN(amountToAdd) || amountToAdd <= 0) return res.status(400).json({ error: "Invalid amount." });
   
   const client = await db.pool.connect();
   try {
     await client.query('BEGIN');
     const loanResult = await client.query("SELECT principal_amount, status, branch_id FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
-    if (loanResult.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Loan not found." }); }
-    
+    if (loanResult.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Not found." }); }
     const currentLoan = loanResult.rows[0];
-    // Branch Access Check
-    if (req.user.role !== 'admin' && currentLoan.branch_id !== req.user.branchId) {
-        await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." });
-    }
-
-    if (currentLoan.status !== 'active' && currentLoan.status !== 'overdue') { await client.query('ROLLBACK'); return res.status(400).json({ error: `Cannot add principal to a loan with status '${currentLoan.status}'.` }); }
+    if (req.user.role !== 'admin' && currentLoan.branch_id !== req.user.branchId) { await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." }); }
+    if (currentLoan.status !== 'active' && currentLoan.status !== 'overdue') { await client.query('ROLLBACK'); return res.status(400).json({ error: `Cannot add principal.` }); }
     
     const currentPrincipal = parseFloat(currentLoan.principal_amount);
     const newPrincipal = currentPrincipal + amountToAdd;
     const updateResult = await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2 RETURNING *", [newPrincipal, loanId]);
     await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4)", [loanId, amountToAdd, 'disbursement', username]);
     await client.query('COMMIT');
-    res.json({ message: `Successfully added ₹${amountToAdd.toFixed(2)}.`, loan: updateResult.rows[0] });
-  } catch (err) {
-    await client.query('ROLLBACK'); console.error("Add Principal Error:", err.message); res.status(500).send("Server Error.");
-  } finally { client.release(); }
+    res.json({ message: `Added ₹${amountToAdd.toFixed(2)}.`, loan: updateResult.rows[0] });
+  } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Error."); } finally { client.release(); }
 });
 
 app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     const loanResult = await db.query("SELECT l.*, pi.item_type, pi.description, pi.quality, pi.weight, pi.gross_weight, pi.net_weight, pi.purity, pi.item_image_data, c.name AS customer_name, c.phone_number, c.address, c.customer_image_url FROM Loans l LEFT JOIN PledgedItems pi ON l.id = pi.loan_id JOIN Customers c ON l.customer_id = c.id WHERE l.id = $1", [id]);
-    if (loanResult.rows.length === 0) return res.status(404).json({ error: "Loan not found." });
-    
+    if (loanResult.rows.length === 0) return res.status(404).json({ error: "Not found." });
     let loanDetails = loanResult.rows[0];
     if (req.user.role !== 'admin' && loanDetails.branch_id !== req.user.branchId) return res.status(403).json({ error: "Access Denied." });
 
     const transactionsResult = await db.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [id]);
-    const transactions = transactionsResult.rows;
-
-    // USE NEW BUCKET LOGIC
-    const financials = calculateLoanFinancials(loanDetails, transactions);
+    
+    const financials = calculateLoanFinancials(loanDetails, transactionsResult.rows);
 
     if (loanDetails.item_image_data) {
         const b64 = loanDetails.item_image_data.toString('base64');
@@ -729,91 +617,60 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
 
     res.json({ 
         loanDetails: loanDetails, 
-        transactions: transactions.sort((a, b) => new Date(b.payment_date) - new Date(a.payment_date)),
+        transactions: transactionsResult.rows.sort((a, b) => new Date(b.payment_date) - new Date(a.payment_date)),
         interestBreakdown: financials.breakdown, 
         calculated: financials
     });
-  } catch (err) { console.error("GET Loan Details Error:", err.message); res.status(500).send("Server Error"); }
+  } catch (err) { res.status(500).send("Error"); }
 });
 
 app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req, res) => {
   const client = await db.pool.connect();
   const username = req.user.username; 
   try {
-    const { 
-      customer_id, principal_amount, interest_rate, book_loan_number, 
-      item_type, description, quality, 
-      gross_weight, net_weight, purity, appraised_value,
-      deductFirstMonthInterest 
-    } = req.body;
-
+    const { customer_id, principal_amount, interest_rate, book_loan_number, item_type, description, quality, gross_weight, net_weight, purity, appraised_value, deductFirstMonthInterest } = req.body;
     const itemImageBuffer = req.file ? req.file.buffer : null;
     const principal = parseFloat(principal_amount);
     const rate = parseFloat(interest_rate); 
-
     if (!customer_id || isNaN(principal) || principal <= 0 || isNaN(rate) || rate <= 0 || !book_loan_number || !item_type || !description) return res.status(400).send("Missing fields.");
-    
-    // Check Customer Branch
     const customerCheck = await client.query("SELECT branch_id, is_deleted FROM Customers WHERE id = $1", [customer_id]);
     if (customerCheck.rows.length === 0 || customerCheck.rows[0].is_deleted) return res.status(404).send("Customer not found.");
-    
     const custBranch = customerCheck.rows[0].branch_id;
-    if (req.user.role !== 'admin' && custBranch !== req.user.branchId) {
-        return res.status(403).json({ error: "Access Denied. Cannot create loan for other branch customer." });
-    }
+    if (req.user.role !== 'admin' && custBranch !== req.user.branchId) return res.status(403).json({ error: "Access Denied." });
 
     await client.query('BEGIN');
-    
     const loanQuery = `INSERT INTO Loans (customer_id, principal_amount, interest_rate, book_loan_number, appraised_value, branch_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`;
     const loanResult = await client.query(loanQuery, [customer_id, principal, rate, book_loan_number, appraised_value || 0, custBranch]);
     const newLoanId = loanResult.rows[0].id;
-
     const finalGrossWeight = gross_weight || req.body.weight; 
-    const itemQuery = `INSERT INTO PledgedItems 
-      (loan_id, item_type, description, quality, weight, gross_weight, net_weight, purity, item_image_data) 
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`;
-      
-    await client.query(itemQuery, [
-      newLoanId, item_type, description, quality, 
-      finalGrossWeight, 
-      finalGrossWeight, 
-      net_weight, purity, itemImageBuffer
-    ]);
-    
+    const itemQuery = `INSERT INTO PledgedItems (loan_id, item_type, description, quality, weight, gross_weight, net_weight, purity, item_image_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`;
+    await client.query(itemQuery, [newLoanId, item_type, description, quality, finalGrossWeight, finalGrossWeight, net_weight, purity, itemImageBuffer]);
     if (deductFirstMonthInterest === 'true') {
       const firstMonthInterest = principal * (rate / 100);
-      if (firstMonthInterest > 0) {
-        await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)", [newLoanId, firstMonthInterest, username]);
-      }
+      if (firstMonthInterest > 0) await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)", [newLoanId, firstMonthInterest, username]);
     }
-
     await client.query('COMMIT');
-    res.status(201).json({ message: "Loan created successfully", loanId: newLoanId });
+    res.status(201).json({ message: "Loan created", loanId: newLoanId });
   } catch (err) {
-    await client.query('ROLLBACK'); console.error("POST Loan Error:", err.message);
+    await client.query('ROLLBACK');
     if (err.code === '23505') return res.status(400).json({ error: "Book Loan Number already exists." });
-    res.status(500).send("Server Error while creating loan");
+    res.status(500).send("Error");
   } finally { client.release(); }
 });
 
 app.get('/api/customers/:id/loans', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    if (isNaN(id)) return res.status(400).json({ error: "Invalid customer ID." });
-    // This endpoint typically called inside Customer Detail, where access is already checked.
-    // But good to double check.
     const cust = await db.query("SELECT branch_id FROM Customers WHERE id = $1", [id]);
-    if (cust.rows.length > 0 && req.user.role !== 'admin' && cust.rows[0].branch_id !== req.user.branchId) {
-        return res.status(403).json({ error: "Access Denied." });
-    }
-
+    if (cust.rows.length > 0 && req.user.role !== 'admin' && cust.rows[0].branch_id !== req.user.branchId) return res.status(403).json({ error: "Access Denied." });
     await db.query("UPDATE Loans SET status = 'overdue' WHERE customer_id = $1 AND due_date < NOW() AND status = 'active'", [id]);
     const query = `SELECT l.id AS loan_id, l.book_loan_number, l.principal_amount, l.pledge_date, l.due_date, l.status, pi.description FROM Loans l LEFT JOIN PledgedItems pi ON l.id = pi.loan_id WHERE l.customer_id = $1 AND l.status != 'deleted' ORDER BY l.pledge_date DESC`;
     const customerLoans = await db.query(query, [id]);
     res.json(customerLoans.rows);
-  } catch (err) { res.status(500).send("Server Error"); }
+  } catch (err) { res.status(500).send("Error"); }
 });
 
+// --- SMART SPLIT LOGIC PRESERVED ---
 app.post('/api/transactions', authenticateToken, async (req, res) => {
   const client = await db.pool.connect();
   const username = req.user.username;
@@ -822,19 +679,13 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
     const loanId = parseInt(loan_id);
     const paymentAmount = parseFloat(amount_paid);
     await client.query('BEGIN');
-
     const loanCheck = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
-    if (loanCheck.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Loan not found." }); }
+    if (loanCheck.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Not found." }); }
     const loan = loanCheck.rows[0];
+    if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) { await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." }); }
 
-    if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) {
-        await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." });
-    }
-
-    // Interest Payment Smart Split Logic using NEW BUCKET CALCULATOR
     if (payment_type === 'interest') {
       const txRes = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
-      
       const financials = calculateLoanFinancials(loan, txRes.rows);
       const outstandingInterest = parseFloat(financials.outstandingInterest);
 
@@ -852,11 +703,10 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
         return res.status(201).json(txs);
       }
     }
-
     const newTx = await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", [loanId, paymentAmount, payment_type, username]);
     await client.query('COMMIT');
     res.status(201).json([newTx.rows[0]]);
-  } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Server Error"); } finally { client.release(); }
+  } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Error"); } finally { client.release(); }
 });
 
 app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
@@ -867,150 +717,81 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
     const { discountAmount, settlementAmount } = req.body;
     const discount = parseFloat(discountAmount) || 0;
     const finalPayment = parseFloat(settlementAmount) || 0;
-
     await client.query('BEGIN');
     const loanRes = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
     const loan = loanRes.rows[0];
-    // Access Check
-    if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) {
-        await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." });
-    }
-
+    if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) { await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." }); }
     const txRes = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
-    
-    // Recalculate using NEW BUCKET LOGIC
     const financials = calculateLoanFinancials(loan, txRes.rows);
     const outstandingInterest = parseFloat(financials.outstandingInterest);
     const totalDue = parseFloat(financials.amountDue);
-
     const remaining = totalDue - finalPayment - discount;
-    if (remaining > 1.0) { 
-       await client.query('ROLLBACK');
-       return res.status(400).json({ error: `Insufficient funds. Due: ${totalDue}, Paid+Disc: ${finalPayment+discount}` });
-    }
+    if (remaining > 1.0) { await client.query('ROLLBACK'); return res.status(400).json({ error: `Insufficient funds. Due: ${totalDue}` }); }
 
     if (finalPayment > 0) {
-        let interestPart = 0;
-        let principalPart = 0;
+        let interestPart = 0; let principalPart = 0;
         if (outstandingInterest > 0) {
-            if (finalPayment >= outstandingInterest) {
-                interestPart = outstandingInterest;
-                principalPart = finalPayment - outstandingInterest;
-            } else {
-                interestPart = finalPayment;
-            }
-        } else {
-            principalPart = finalPayment;
-        }
+            if (finalPayment >= outstandingInterest) { interestPart = outstandingInterest; principalPart = finalPayment - outstandingInterest; } 
+            else { interestPart = finalPayment; }
+        } else { principalPart = finalPayment; }
         if (interestPart > 0) await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)", [loanId, interestPart, username]);
         if (principalPart > 0) await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3)", [loanId, principalPart, username]);
     }
     if (discount > 0) await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'discount', NOW(), $3)", [loanId, discount, username]);
-
-    const closeLoan = await client.query("UPDATE Loans SET status = 'paid', closed_date = NOW() WHERE id = $1 RETURNING *", [loanId]);
+    await client.query("UPDATE Loans SET status = 'paid', closed_date = NOW() WHERE id = $1", [loanId]);
     await client.query('COMMIT');
-    res.json({ message: "Settled", loan: closeLoan.rows[0] });
-  } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Server Error"); } finally { client.release(); }
+    res.json({ message: "Settled" });
+  } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Error"); } finally { client.release(); }
 });
 
-// Admin OR Manager can delete
 app.delete('/api/loans/:id', authenticateToken, authorizeManagement, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    if (isNaN(id)) return res.status(400).json({ error: "Invalid loan ID." });
-    
     const loanResult = await db.query("SELECT status, book_loan_number, branch_id FROM Loans WHERE id = $1", [id]);
-    if (loanResult.rows.length === 0) return res.status(404).json({ error: "Loan not found." });
-    
+    if (loanResult.rows.length === 0) return res.status(404).json({ error: "Not found." });
     const loan = loanResult.rows[0];
-    if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) {
-        return res.status(403).json({ error: "Access Denied." });
-    }
-
-    if (loan.status === 'active' || loan.status === 'overdue') return res.status(400).json({ error: "Cannot delete an active or overdue loan. Please settle it first." });
-    
+    if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) return res.status(403).json({ error: "Access Denied." });
+    if (loan.status === 'active' || loan.status === 'overdue') return res.status(400).json({ error: "Settle first." });
     const deleteLoanResult = await db.query("UPDATE Loans SET status = 'deleted' WHERE id = $1 RETURNING id, book_loan_number", [id]);
-    res.json({ message: `Loan #${deleteLoanResult.rows[0].book_loan_number} moved to recycle bin.` });
-  } catch (err) { console.error("DELETE Loan Error:", err.message); res.status(500).send("Server Error"); }
+    res.json({ message: `Loan #${deleteLoanResult.rows[0].book_loan_number} recycled.` });
+  } catch (err) { res.status(500).send("Error"); }
 });
 
 app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (req, res) => {
     const { id } = req.params;
     const loanId = parseInt(id);
     const username = req.user.username; 
-    const { 
-        book_loan_number, interest_rate, pledge_date, due_date, appraised_value,
-        item_type, description, quality, 
-        gross_weight, net_weight, purity 
-    } = req.body;
-
+    const { book_loan_number, interest_rate, pledge_date, due_date, appraised_value, item_type, description, quality, gross_weight, net_weight, purity } = req.body;
     const newItemImageBuffer = req.file ? req.file.buffer : undefined;
     const removeItemImage = req.body.removeItemImage === 'true';
-
-    if (isNaN(loanId) || loanId <= 0) return res.status(400).json({ error: "Invalid loan ID." });
-    
+    if (isNaN(loanId) || loanId <= 0) return res.status(400).json({ error: "Invalid ID." });
     const client = await db.pool.connect();
     try {
         await client.query('BEGIN');
-        
-        const currentDataQuery = `
-            SELECT l.book_loan_number, l.interest_rate, l.pledge_date, l.due_date, l.status, l.appraised_value, l.branch_id,
-                   pi.id AS item_id, pi.item_type, pi.description, pi.quality, 
-                   pi.weight, pi.gross_weight, pi.net_weight, pi.purity, pi.item_image_data 
-            FROM "loans" l 
-            LEFT JOIN "pledgeditems" pi ON l.id = pi.loan_id 
-            WHERE l.id = $1 FOR UPDATE OF l`;
-            
+        const currentDataQuery = `SELECT l.*, pi.id AS item_id, pi.* FROM "loans" l LEFT JOIN "pledgeditems" pi ON l.id = pi.loan_id WHERE l.id = $1 FOR UPDATE OF l`;
         const currentResult = await client.query(currentDataQuery, [loanId]);
-        if (currentResult.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Loan not found." }); }
-        
+        if (currentResult.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Not found." }); }
         const oldData = currentResult.rows[0];
-
-        // Access Check
-        if (req.user.role !== 'admin' && oldData.branch_id !== req.user.branchId) {
-             await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." });
-        }
-
+        if (req.user.role !== 'admin' && oldData.branch_id !== req.user.branchId) { await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." }); }
         const itemId = oldData.item_id;
-        if (oldData.status === 'deleted') { await client.query('ROLLBACK'); return res.status(400).json({ error: "Cannot edit a deleted loan." }); }
-
         const historyLogs = [];
         const loanUpdateFields = []; const loanUpdateValues = [];
         const itemUpdateFields = []; const itemUpdateValues = [];
 
         const addUpdate = (table, field, newValue, oldValue, fieldsArray, valuesArray, logLabel = field) => {
             if (newValue === undefined) return; 
-            let dbValue = newValue;
-            if (dbValue === "") dbValue = null;
-            let oldValCompare = oldValue;
-            let newValCompare = dbValue;
-
-            const dateFields = ['pledge_date', 'due_date'];
-            if (dateFields.includes(field)) {
-                if (oldValue) {
-                    const d = new Date(oldValue);
-                    const year = d.getFullYear();
-                    const month = String(d.getMonth() + 1).padStart(2, '0');
-                    const day = String(d.getDate()).padStart(2, '0');
-                    oldValCompare = `${year}-${month}-${day}`;
-                } else { oldValCompare = null; }
+            let dbValue = newValue === "" ? null : newValue;
+            let oldValCompare = oldValue; let newValCompare = dbValue;
+            if (['pledge_date', 'due_date'].includes(field)) {
+                if (oldValue) { const d = new Date(oldValue); oldValCompare = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; } else oldValCompare = null;
                 newValCompare = dbValue; 
-            } 
-            else if (typeof oldValue === 'number' || !isNaN(parseFloat(oldValue))) {
+            } else if (typeof oldValue === 'number' || !isNaN(parseFloat(oldValue))) {
                 if (oldValue !== null) oldValCompare = parseFloat(oldValue);
                 if (dbValue !== null) newValCompare = parseFloat(dbValue);
             }
-
             if (newValCompare !== oldValCompare) {
-                fieldsArray.push(`"${field}"`);
-                valuesArray.push(dbValue);
-                historyLogs.push({ 
-                    loan_id: loanId, 
-                    field_changed: logLabel, 
-                    old_value: String(oldValue ?? 'null'), 
-                    new_value: String(dbValue ?? 'null'), 
-                    changed_by_username: username 
-                });
+                fieldsArray.push(`"${field}"`); valuesArray.push(dbValue);
+                historyLogs.push({ loan_id: loanId, field_changed: logLabel, old_value: String(oldValue ?? 'null'), new_value: String(dbValue ?? 'null'), changed_by_username: username });
             }
         };
 
@@ -1024,588 +805,242 @@ app.put('/api/loans/:id', authenticateToken, upload.single('itemPhoto'), async (
             addUpdate('pledgeditems', 'item_type', item_type, oldData.item_type, itemUpdateFields, itemUpdateValues);
             addUpdate('pledgeditems', 'description', description, oldData.description, itemUpdateFields, itemUpdateValues);
             addUpdate('pledgeditems', 'quality', quality, oldData.quality, itemUpdateFields, itemUpdateValues);
-            
             addUpdate('pledgeditems', 'weight', gross_weight, oldData.weight, itemUpdateFields, itemUpdateValues, 'gross_weight (legacy)');
             addUpdate('pledgeditems', 'gross_weight', gross_weight, oldData.gross_weight, itemUpdateFields, itemUpdateValues);
             addUpdate('pledgeditems', 'net_weight', net_weight, oldData.net_weight, itemUpdateFields, itemUpdateValues);
             addUpdate('pledgeditems', 'purity', purity, oldData.purity, itemUpdateFields, itemUpdateValues);
-
             if (newItemImageBuffer !== undefined || removeItemImage) {
                 const finalImageValue = removeItemImage ? null : newItemImageBuffer;
                 itemUpdateFields.push(`"item_image_data"`); itemUpdateValues.push(finalImageValue);
-                
-                historyLogs.push({ 
-                    loan_id: loanId, 
-                    field_changed: 'item_image', 
-                    old_value: oldData.item_image_data ? '[Image Data]' : '[No Image]', 
-                    new_value: finalImageValue ? '[New Image Data]' : '[Image Removed]', 
-                    changed_by_username: username 
-                });
+                historyLogs.push({ loan_id: loanId, field_changed: 'item_image', old_value: oldData.item_image_data ? '[Image]' : '[None]', new_value: finalImageValue ? '[New]' : '[Removed]', changed_by_username: username });
             }
         }
 
         if (loanUpdateFields.length > 0) {
-            const loanSetClause = loanUpdateFields.map((field, i) => `${field} = $${i + 1}`).join(', ');
-            loanUpdateValues.push(loanId); 
-            await client.query(`UPDATE "loans" SET ${loanSetClause} WHERE id = $${loanUpdateValues.length}`, loanUpdateValues);
+            const setClause = loanUpdateFields.map((f, i) => `${f}=$${i+1}`).join(', ');
+            loanUpdateValues.push(loanId);
+            await client.query(`UPDATE "loans" SET ${setClause} WHERE id=$${loanUpdateValues.length}`, loanUpdateValues);
         }
-
         if (itemUpdateFields.length > 0 && itemId) {
-            const itemSetClause = itemUpdateFields.map((field, i) => `${field} = $${i + 1}`).join(', ');
-            itemUpdateValues.push(itemId); 
-            await client.query(`UPDATE "pledgeditems" SET ${itemSetClause} WHERE id = $${itemUpdateValues.length}`, itemUpdateValues);
+            const setClause = itemUpdateFields.map((f, i) => `${f}=$${i+1}`).join(', ');
+            itemUpdateValues.push(itemId);
+            await client.query(`UPDATE "pledgeditems" SET ${setClause} WHERE id=$${itemUpdateValues.length}`, itemUpdateValues);
         }
-
         if (historyLogs.length > 0) {
-            const historyInsertQuery = `INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username) VALUES ($1, $2, $3, $4, $5)`;
-            for (const log of historyLogs) {
-                await client.query(historyInsertQuery, [log.loan_id, log.field_changed, log.old_value, log.new_value, log.changed_by_username]);
-            }
+            const q = `INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username) VALUES ($1, $2, $3, $4, $5)`;
+            for (const log of historyLogs) await client.query(q, [log.loan_id, log.field_changed, log.old_value, log.new_value, log.changed_by_username]);
         }
-
         await client.query('COMMIT');
-        res.json({ message: `Loan ${loanId} updated successfully. ${historyLogs.length} changes logged.` });
-
-    } catch (err) {
-        await client.query('ROLLBACK'); 
-        console.error(`Error updating loan ${loanId}:`, err.message);
-        if (err.code === '23505') return res.status(400).json({ error: "Book Loan Number already exists." });
-        res.status(500).send("Server Error while updating loan.");
-    } finally { 
-        client.release(); 
-    }
+        res.json({ message: `Updated.` });
+    } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Error"); } finally { client.release(); }
 });
 
 app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
-    const { id } = req.params;
-    const loanId = parseInt(id);
-    if (isNaN(loanId)) return res.status(400).json({ error: "Invalid loan ID." });
-    
-    // Access Check (View Only)
+    const { id } = req.params; const loanId = parseInt(id);
+    if (isNaN(loanId)) return res.status(400).json({ error: "Invalid ID." });
     const check = await db.query("SELECT branch_id FROM Loans WHERE id=$1", [loanId]);
-    if(check.rows.length > 0 && req.user.role!=='admin' && check.rows[0].branch_id !== req.user.branchId) {
-        return res.status(403).json({ error: "Access Denied."});
-    }
-
+    if(check.rows.length > 0 && req.user.role!=='admin' && check.rows[0].branch_id !== req.user.branchId) return res.status(403).json({ error: "Access Denied."});
     try {
-        const historyQuery = `
-          (SELECT id, changed_at, changed_by_username, 'edit' AS event_type, field_changed, old_value, new_value, NULL AS amount_paid, NULL AS payment_type FROM loan_history WHERE loan_id = $1)
-          UNION ALL
-          (SELECT id, payment_date AS changed_at, changed_by_username, 'transaction' AS event_type, NULL AS field_changed, NULL AS old_value, NULL AS new_value, amount_paid, payment_type FROM Transactions WHERE loan_id = $1)
-          ORDER BY changed_at DESC;
-        `;
-        const historyResult = await db.query(historyQuery, [loanId]);
-        res.json(historyResult.rows);
-    } catch (err) { res.status(500).send("Server Error fetching loan history."); }
+        const q = `(SELECT id, changed_at, changed_by_username, 'edit' AS event_type, field_changed, old_value, new_value, NULL AS amount_paid, NULL AS payment_type FROM loan_history WHERE loan_id = $1) UNION ALL (SELECT id, payment_date AS changed_at, changed_by_username, 'transaction' AS event_type, NULL AS field_changed, NULL AS old_value, NULL AS new_value, amount_paid, payment_type FROM Transactions WHERE loan_id = $1) ORDER BY changed_at DESC`;
+        const resH = await db.query(q, [loanId]);
+        res.json(resH.rows);
+    } catch (err) { res.status(500).send("Error"); }
 });
 
-
-// --- BRANCH MANAGEMENT ROUTES (Admin/Manager) ---
-// 1. GET ALL Branches
 app.get('/api/branches', authenticateToken, authorizeManagement, async (req, res) => {
   try {
-    if (req.user.role === 'admin') {
-        const result = await db.query("SELECT * FROM branches ORDER BY id ASC");
-        res.json(result.rows);
-    } else {
-        const result = await db.query("SELECT * FROM branches WHERE id = $1", [req.user.branchId]);
-        res.json(result.rows);
-    }
-  } catch (err) {
-    console.error("Get Branches Error:", err);
-    res.status(500).send("Server Error");
-  }
+    if (req.user.role === 'admin') { const r = await db.query("SELECT * FROM branches ORDER BY id ASC"); res.json(r.rows); }
+    else { const r = await db.query("SELECT * FROM branches WHERE id = $1", [req.user.branchId]); res.json(r.rows); }
+  } catch (err) { res.status(500).send("Error"); }
 });
 
-// 2. GET Single Branch
 app.get('/api/branches/:id', authenticateToken, async (req, res) => {
   try {
-    const { id } = req.params;
-    const branchId = parseInt(id);
-
-    if (req.user.role !== 'admin' && req.user.branchId !== branchId) {
-        return res.status(403).send("Access Denied: You can only view your own branch details.");
-    }
-
-    const result = await db.query("SELECT * FROM branches WHERE id = $1", [branchId]);
-    if (result.rows.length === 0) return res.status(404).send("Branch not found.");
-    res.json(result.rows[0]);
-  } catch (err) { 
-    console.error("Get Branch Details Error:", err);
-    res.status(500).send("Server Error"); 
-  }
+    const id = parseInt(req.params.id);
+    if (req.user.role !== 'admin' && req.user.branchId !== id) return res.status(403).send("Denied");
+    const r = await db.query("SELECT * FROM branches WHERE id = $1", [id]);
+    if (r.rows.length === 0) return res.status(404).send("Not found");
+    res.json(r.rows[0]);
+  } catch (err) { res.status(500).send("Error"); }
 });
 
-// 3. CREATE New Branch (Admin Only)
 app.post('/api/branches', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const { branch_name, branch_code, address, phone_number } = req.body;
-    if (!branch_name || !branch_code) return res.status(400).json({ error: "Branch Name and Code are required." });
-
-    const result = await db.query(
-      "INSERT INTO branches (branch_name, branch_code, address, phone_number) VALUES ($1, $2, $3, $4) RETURNING *",
-      [branch_name, branch_code, address, phone_number]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (err) {
-    if (err.code === '23505') return res.status(400).json({ error: "Branch Name or Code already exists." });
-    console.error("Create Branch Error:", err);
-    res.status(500).send("Server Error");
-  }
+    if (!branch_name || !branch_code) return res.status(400).json({ error: "Name/Code required." });
+    const r = await db.query("INSERT INTO branches (branch_name, branch_code, address, phone_number) VALUES ($1, $2, $3, $4) RETURNING *", [branch_name, branch_code, address, phone_number]);
+    res.status(201).json(r.rows[0]);
+  } catch (err) { res.status(500).send("Error"); }
 });
 
-// 4. UPDATE Branch
 app.put('/api/branches/:id', authenticateToken, authorizeAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { branch_name, branch_code, address, phone_number, license_number, is_active } = req.body;
-
-    const existing = await db.query("SELECT * FROM branches WHERE id = $1", [id]);
-    if (existing.rows.length === 0) return res.status(404).send("Branch not found.");
-    
-    const old = existing.rows[0];
-    
-    const newName = branch_name || old.branch_name;
-    const newCode = branch_code || old.branch_code;
-    const newAddr = address || old.address;
-    const newPhone = phone_number || old.phone_number;
-    const newLicense = license_number || old.license_number;
-    const newActive = (is_active !== undefined) ? is_active : old.is_active;
-
-    const result = await db.query(
-      `UPDATE branches 
-       SET branch_name = $1, branch_code = $2, address = $3, phone_number = $4, license_number = $5, is_active = $6 
-       WHERE id = $7 RETURNING *`,
-      [newName, newCode, newAddr, newPhone, newLicense, newActive, id]
-    );
-    
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error("Update Branch Error:", err); 
-    res.status(500).send("Server Error");
-  }
+    const ex = await db.query("SELECT * FROM branches WHERE id = $1", [id]);
+    if (ex.rows.length === 0) return res.status(404).send("Not found");
+    const old = ex.rows[0];
+    const r = await db.query(`UPDATE branches SET branch_name=$1, branch_code=$2, address=$3, phone_number=$4, license_number=$5, is_active=$6 WHERE id=$7 RETURNING *`,
+      [branch_name||old.branch_name, branch_code||old.branch_code, address||old.address, phone_number||old.phone_number, license_number||old.license_number, is_active!==undefined?is_active:old.is_active, id]);
+    res.json(r.rows[0]);
+  } catch (err) { res.status(500).send("Error"); }
 });
 
-// --- DASHBOARD STATS (Fixed for Multi-Branch) ---
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
   try {
     const targetBranch = getTargetBranchId(req);
-    let whereClause = " WHERE 1=1 "; 
-    const params = [];
-    if (targetBranch) { whereClause += ` AND branch_id = $1`; params.push(targetBranch); }
-    
+    let wc = " WHERE 1=1 "; const p = [];
+    if (targetBranch) { wc += ` AND branch_id = $1`; p.push(targetBranch); }
     await db.query("UPDATE Loans SET status = 'overdue' WHERE due_date < NOW() AND status = 'active'" + (targetBranch ? ` AND branch_id=${targetBranch}` : ""));
-
-    const [principalRes, activeRes, overdueRes, customersRes, loansRes, paidRes, forfeitedRes, disbursedRes] = await Promise.all([
-      db.query(`SELECT SUM(principal_amount) FROM Loans ${whereClause} AND (status = 'active' OR status = 'overdue')`, params),
-      db.query(`SELECT COUNT(*) FROM Loans ${whereClause} AND (status = 'active' OR status = 'overdue')`, params),
-      db.query(`SELECT COUNT(*) FROM Loans ${whereClause} AND status = 'overdue'`, params),
-      db.query(`SELECT COUNT(*) FROM Customers ${whereClause} AND is_deleted = false`, params),
-      db.query(`SELECT COUNT(*) FROM Loans ${whereClause} AND status != 'deleted'`, params),
-      db.query(`SELECT COUNT(*) FROM Loans ${whereClause} AND status = 'paid'`, params),
-      db.query(`SELECT COUNT(*) FROM Loans ${whereClause} AND status = 'forfeited'`, params),
-      db.query(`SELECT SUM(principal_amount) FROM Loans ${whereClause} AND status != 'deleted'`, params)
+    const [pRes, aRes, oRes, cRes, lRes, pdRes, fRes, dRes] = await Promise.all([
+      db.query(`SELECT SUM(principal_amount) FROM Loans ${wc} AND (status='active' OR status='overdue')`, p),
+      db.query(`SELECT COUNT(*) FROM Loans ${wc} AND (status='active' OR status='overdue')`, p),
+      db.query(`SELECT COUNT(*) FROM Loans ${wc} AND status='overdue'`, p),
+      db.query(`SELECT COUNT(*) FROM Customers ${wc} AND is_deleted=false`, p),
+      db.query(`SELECT COUNT(*) FROM Loans ${wc} AND status!='deleted'`, p),
+      db.query(`SELECT COUNT(*) FROM Loans ${wc} AND status='paid'`, p),
+      db.query(`SELECT COUNT(*) FROM Loans ${wc} AND status='forfeited'`, p),
+      db.query(`SELECT SUM(principal_amount) FROM Loans ${wc} AND status!='deleted'`, p)
     ]);
-
-    // Calculate Exact Accrued Interest using new function
-    let totalInterestAccrued = 0;
-    const loansQuery = `SELECT * FROM Loans ${whereClause} AND (status = 'active' OR status = 'overdue')`;
-    const loansResult = await db.query(loansQuery, params);
-    const activeLoans = loansResult.rows;
-
-    if (activeLoans.length > 0) {
-        const loanIds = activeLoans.map(l => l.id);
-        const txQuery = `SELECT * FROM Transactions WHERE loan_id = ANY($1::int[])`;
-        const txResult = await db.query(txQuery, [loanIds]);
-        const allTxs = txResult.rows;
-
-        for (const loan of activeLoans) {
-            const loanTxs = allTxs.filter(t => t.loan_id === loan.id);
-            const financials = calculateLoanFinancials(loan, loanTxs);
-            totalInterestAccrued += parseFloat(financials.outstandingInterest);
+    let totalInt = 0;
+    const lQ = `SELECT * FROM Loans ${wc} AND (status='active' OR status='overdue')`;
+    const lR = await db.query(lQ, p);
+    if (lR.rows.length > 0) {
+        const ids = lR.rows.map(l => l.id);
+        const tR = await db.query(`SELECT * FROM Transactions WHERE loan_id = ANY($1::int[])`, [ids]);
+        for (const loan of lR.rows) {
+            const txs = tR.rows.filter(t => t.loan_id === loan.id);
+            const fin = calculateLoanFinancials(loan, txs);
+            totalInt += parseFloat(fin.outstandingInterest);
         }
     }
-
     res.json({
-      totalPrincipalOut: parseFloat(principalRes.rows[0].sum || 0),
-      totalInterestAccrued: totalInterestAccrued, 
-      totalActiveLoans: parseInt(activeRes.rows[0].count || 0),
-      totalOverdueLoans: parseInt(overdueRes.rows[0].count || 0),
-      totalCustomers: parseInt(customersRes.rows[0].count || 0),
-      totalLoans: parseInt(loansRes.rows[0].count || 0),
-      totalValue: parseFloat(disbursedRes.rows[0].sum || 0),
-      loansActive: parseInt(activeRes.rows[0].count || 0),
-      loansOverdue: parseInt(overdueRes.rows[0].count || 0),
-      loansPaid: parseInt(paidRes.rows[0].count || 0),
-      loansForfeited: parseInt(forfeitedRes.rows[0].count || 0)
+      totalPrincipalOut: parseFloat(pRes.rows[0].sum || 0),
+      totalInterestAccrued: totalInt, 
+      totalActiveLoans: parseInt(aRes.rows[0].count || 0),
+      totalOverdueLoans: parseInt(oRes.rows[0].count || 0),
+      totalCustomers: parseInt(cRes.rows[0].count || 0),
+      totalLoans: parseInt(lRes.rows[0].count || 0),
+      totalValue: parseFloat(dRes.rows[0].sum || 0),
+      loansActive: parseInt(aRes.rows[0].count || 0),
+      loansOverdue: parseInt(oRes.rows[0].count || 0),
+      loansPaid: parseInt(pdRes.rows[0].count || 0),
+      loansForfeited: parseInt(fRes.rows[0].count || 0)
     });
-  } catch (err) { res.status(500).send("Server Error."); }
+  } catch (err) { res.status(500).send("Error"); }
 });
 
-// --- REPORTS (Scoped) ---
 app.get('/api/reports/financial-summary', authenticateToken, authorizeManagement, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
-    if (!startDate || !endDate) return res.status(400).json({ error: "Start/End date required." });
-    
+    if (!startDate || !endDate) return res.status(400).json({ error: "Required." });
     const targetBranch = getTargetBranchId(req);
-    const params = [startDate, endDate];
-    let branchClause = "";
-    if (targetBranch) {
-        branchClause = " AND l.branch_id = $3";
-        params.push(targetBranch);
-    }
-
-    // Join with Loans table to verify branch
-    const baseTxQuery = (type) => `
-        SELECT SUM(t.amount_paid) as total 
-        FROM Transactions t
-        JOIN Loans l ON t.loan_id = l.id
-        WHERE t.payment_type = ${type} 
-        AND t.payment_date >= $1 AND t.payment_date <= $2
-        ${branchClause}
-    `;
-
-    const principalQuery = `
-        SELECT SUM(t.amount_paid) as total 
-        FROM Transactions t
-        JOIN Loans l ON t.loan_id = l.id
-        WHERE (t.payment_type = 'principal' OR t.payment_type = 'settlement')
-        AND t.payment_date >= $1 AND t.payment_date <= $2
-        ${branchClause}
-    `;
-    
-    const loansCountQuery = `
-        SELECT COUNT(*) as count 
-        FROM Loans l
-        WHERE l.pledge_date >= $1 AND l.pledge_date <= $2
-        ${targetBranch ? 'AND l.branch_id = $3' : ''}
-    `;
-
-    const [disbursedRes, interestRes, principalRepaidRes, discountRes, loansCountRes] = await Promise.all([
-      db.query(baseTxQuery("'disbursement'"), params),
-      db.query(baseTxQuery("'interest'"), params),
-      db.query(principalQuery, params),
-      db.query(baseTxQuery("'discount'"), params),
-      db.query(loansCountQuery, params) 
-    ]);
-
-    const totalInterest = parseFloat(interestRes.rows[0].total || 0);
-    const totalDiscount = parseFloat(discountRes.rows[0].total || 0);
-    
-    res.json({
-      startDate,
-      endDate,
-      totalDisbursed: parseFloat(disbursedRes.rows[0].total || 0),
-      totalInterest,
-      totalPrincipalRepaid: parseFloat(principalRepaidRes.rows[0].total || 0),
-      totalDiscount,
-      netProfit: totalInterest - totalDiscount,
-      loansCreatedCount: parseInt(loansCountRes.rows[0].count || 0) 
-    });
-
-  } catch (err) {
-    res.status(500).send("Server Error");
-  }
+    const p = [startDate, endDate]; let bc = "";
+    if (targetBranch) { bc = " AND l.branch_id = $3"; p.push(targetBranch); }
+    const q1 = `SELECT SUM(t.amount_paid) as total FROM Transactions t JOIN Loans l ON t.loan_id=l.id WHERE t.payment_type='disbursement' AND t.payment_date >= $1 AND t.payment_date <= $2 ${bc}`;
+    const q2 = `SELECT SUM(t.amount_paid) as total FROM Transactions t JOIN Loans l ON t.loan_id=l.id WHERE t.payment_type='interest' AND t.payment_date >= $1 AND t.payment_date <= $2 ${bc}`;
+    const q3 = `SELECT SUM(t.amount_paid) as total FROM Transactions t JOIN Loans l ON t.loan_id=l.id WHERE (t.payment_type='principal' OR t.payment_type='settlement') AND t.payment_date >= $1 AND t.payment_date <= $2 ${bc}`;
+    const q4 = `SELECT SUM(t.amount_paid) as total FROM Transactions t JOIN Loans l ON t.loan_id=l.id WHERE t.payment_type='discount' AND t.payment_date >= $1 AND t.payment_date <= $2 ${bc}`;
+    const q5 = `SELECT COUNT(*) as count FROM Loans l WHERE l.pledge_date >= $1 AND l.pledge_date <= $2 ${targetBranch ? 'AND l.branch_id = $3' : ''}`;
+    const [r1, r2, r3, r4, r5] = await Promise.all([db.query(q1,p), db.query(q2,p), db.query(q3,p), db.query(q4,p), db.query(q5,p)]);
+    res.json({ startDate, endDate, totalDisbursed: parseFloat(r1.rows[0].total||0), totalInterest: parseFloat(r2.rows[0].total||0), totalPrincipalRepaid: parseFloat(r3.rows[0].total||0), totalDiscount: parseFloat(r4.rows[0].total||0), netProfit: parseFloat(r2.rows[0].total||0)-parseFloat(r4.rows[0].total||0), loansCreatedCount: parseInt(r5.rows[0].count||0) });
+  } catch (err) { res.status(500).send("Error"); }
 });
 
 app.get('/api/reports/day-book', authenticateToken, authorizeManagement, async (req, res) => {
   try {
-    const dateParam = req.query.date; 
-    if (!dateParam) return res.status(400).json({ error: "Date is required." });
-
-    const targetBranch = getTargetBranchId(req);
-    const params = [dateParam];
-    let branchClause = "";
-    if (targetBranch) {
-        branchClause = " AND l.branch_id = $2";
-        params.push(targetBranch);
-    }
-
-    // Opening Balance
-    // Sum of all INFLOW (Interest+Principal) - OUTFLOW (Disbursement) before this date
-    // Scoped by branch
-    const openingBalanceQuery = `
-      SELECT 
-        SUM(CASE WHEN t.payment_type IN ('interest', 'principal', 'settlement') THEN t.amount_paid ELSE 0 END) -
-        SUM(CASE WHEN t.payment_type = 'disbursement' THEN t.amount_paid ELSE 0 END) as balance
-      FROM Transactions t
-      JOIN Loans l ON t.loan_id = l.id
-      WHERE (t.payment_date AT TIME ZONE 'Asia/Kolkata')::date < $1::date
-      ${branchClause}
-    `;
-    
-    const dayTransactionsQuery = `
-      SELECT t.*, l.book_loan_number, c.name as customer_name 
-      FROM Transactions t
-      JOIN Loans l ON t.loan_id = l.id
-      JOIN Customers c ON l.customer_id = c.id
-      WHERE (t.payment_date AT TIME ZONE 'Asia/Kolkata')::date = $1::date 
-      AND t.payment_type != 'discount'
-      ${branchClause}
-      ORDER BY t.payment_date ASC
-    `;
-
-    const [openingRes, dayRes] = await Promise.all([
-      db.query(openingBalanceQuery, params),
-      db.query(dayTransactionsQuery, params)
-    ]);
-
-    res.json({
-      date: dateParam,
-      openingBalance: parseFloat(openingRes.rows[0].balance || 0),
-      transactions: dayRes.rows
-    });
-
-  } catch (err) {
-    console.error("Day Book Error:", err.message);
-    res.status(500).send("Server Error");
-  }
+    const dateParam = req.query.date; if (!dateParam) return res.status(400).json({ error: "Date required" });
+    const targetBranch = getTargetBranchId(req); const p = [dateParam]; let bc = "";
+    if (targetBranch) { bc = " AND l.branch_id = $2"; p.push(targetBranch); }
+    const q1 = `SELECT SUM(CASE WHEN t.payment_type IN ('interest','principal','settlement') THEN t.amount_paid ELSE 0 END) - SUM(CASE WHEN t.payment_type='disbursement' THEN t.amount_paid ELSE 0 END) as balance FROM Transactions t JOIN Loans l ON t.loan_id=l.id WHERE (t.payment_date AT TIME ZONE 'Asia/Kolkata')::date < $1::date ${bc}`;
+    const q2 = `SELECT t.*, l.book_loan_number, c.name as customer_name FROM Transactions t JOIN Loans l ON t.loan_id=l.id JOIN Customers c ON l.customer_id=c.id WHERE (t.payment_date AT TIME ZONE 'Asia/Kolkata')::date = $1::date AND t.payment_type != 'discount' ${bc} ORDER BY t.payment_date ASC`;
+    const [r1, r2] = await Promise.all([db.query(q1, p), db.query(q2, p)]);
+    res.json({ date: dateParam, openingBalance: parseFloat(r1.rows[0].balance||0), transactions: r2.rows });
+  } catch (err) { res.status(500).send("Error"); }
 });
 
-// --- RECYCLE BIN ---
-// Admin sees all. Manager sees their branch deleted items.
 app.get('/api/recycle-bin/deleted', authenticateToken, authorizeManagement, async (req, res) => {
   try {
-    const targetBranch = getTargetBranchId(req);
-    const params = [];
-    let custWhere = " WHERE is_deleted = true";
-    let loanWhere = " WHERE l.status = 'deleted' AND c.is_deleted = false";
-    
-    if (targetBranch) {
-        custWhere += " AND branch_id = $1";
-        loanWhere += " AND l.branch_id = $1";
-        params.push(targetBranch);
-    }
-
-    const [deletedCustomers, deletedLoans] = await Promise.all([
-      db.query(`SELECT id, name, phone_number, 'Customer' as type FROM Customers ${custWhere}`, params),
-      db.query(`SELECT l.id, l.book_loan_number, c.name as customer_name, 'Loan' as type FROM Loans l JOIN Customers c ON l.customer_id = c.id ${loanWhere}`, params)
-    ]);
-    res.json({ customers: deletedCustomers.rows, loans: deletedLoans.rows });
-  } catch (err) { res.status(500).send("Server Error"); }
+    const targetBranch = getTargetBranchId(req); const p = []; let cw = " WHERE is_deleted=true"; let lw = " WHERE l.status='deleted' AND c.is_deleted=false";
+    if (targetBranch) { cw += " AND branch_id=$1"; lw += " AND l.branch_id=$1"; p.push(targetBranch); }
+    const [c, l] = await Promise.all([db.query(`SELECT id, name, phone_number, 'Customer' as type FROM Customers ${cw}`, p), db.query(`SELECT l.id, l.book_loan_number, c.name as customer_name, 'Loan' as type FROM Loans l JOIN Customers c ON l.customer_id=c.id ${lw}`, p)]);
+    res.json({ customers: c.rows, loans: l.rows });
+  } catch (err) { res.status(500).send("Error"); }
 });
 
 app.post('/api/customers/:id/restore', authenticateToken, authorizeManagement, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    if (isNaN(id)) return res.status(400).json({ error: "Invalid customer ID." });
-    
-    // Check branch
     const check = await db.query("SELECT branch_id FROM Customers WHERE id=$1", [id]);
     if (check.rows.length === 0) return res.status(404).send("Not found");
     if (req.user.role !== 'admin' && check.rows[0].branch_id !== req.user.branchId) return res.status(403).send("Denied");
-
-    const restoreCustomerResult = await db.query("UPDATE Customers SET is_deleted = false WHERE id = $1 RETURNING id, name", [id]);
-    await db.query("UPDATE Loans SET status = 'paid' WHERE customer_id = $1 AND status = 'deleted'", [id]);
-    res.json({ message: `Customer '${restoreCustomerResult.rows[0].name}' restored.` });
-  } catch (err) { res.status(500).send("Server Error"); }
+    await db.query("UPDATE Customers SET is_deleted=false WHERE id=$1", [id]);
+    await db.query("UPDATE Loans SET status='paid' WHERE customer_id=$1 AND status='deleted'", [id]);
+    res.json({ message: "Restored." });
+  } catch (err) { res.status(500).send("Error"); }
 });
 
 app.delete('/api/customers/:id/permanent-delete', authenticateToken, authorizeAdmin, async (req, res) => {
-    // Permanent Delete is Admin Only (Safety)
-    const { id } = req.params;
-    const customerId = parseInt(id);
-    if (isNaN(customerId)) return res.status(400).json({ error: "Invalid customer ID." });
-    
-    const client = await db.pool.connect();
-    try {
-        await client.query('BEGIN');
-        const loanIdsResult = await client.query("SELECT id FROM Loans WHERE customer_id = $1", [customerId]);
-        const loanIds = loanIdsResult.rows.map(row => row.id);
-
-        if (loanIds.length > 0) {
-            const loanIdString = loanIds.join(',');
-            await client.query(`DELETE FROM PledgedItems WHERE loan_id IN (${loanIdString})`);
-            await client.query(`DELETE FROM Transactions WHERE loan_id IN (${loanIdString})`);
-            await client.query(`DELETE FROM loan_history WHERE loan_id IN (${loanIdString})`);
-            await client.query(`DELETE FROM Loans WHERE customer_id = $1`, [customerId]);
-        }
-
-        const deleteCustomerResult = await client.query("DELETE FROM Customers WHERE id = $1 AND is_deleted = true RETURNING name", [customerId]);
-        if (deleteCustomerResult.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: "Deleted customer not found." });
-        }
-        await client.query('COMMIT');
-        res.json({ message: `Customer '${deleteCustomerResult.rows[0].name}' permanently deleted.` });
-    } catch (err) {
-        await client.query('ROLLBACK');
-        console.error("PERMANENT DELETE Customer Error:", err.message);
-        res.status(500).send("Server Error during permanent deletion.");
-    } finally { client.release(); }
+    const id = parseInt(req.params.id); const client = await db.pool.connect();
+    try { await client.query('BEGIN');
+        const lR = await client.query("SELECT id FROM Loans WHERE customer_id=$1", [id]);
+        const lIds = lR.rows.map(r => r.id);
+        if (lIds.length > 0) { const s = lIds.join(','); await client.query(`DELETE FROM PledgedItems WHERE loan_id IN (${s})`); await client.query(`DELETE FROM Transactions WHERE loan_id IN (${s})`); await client.query(`DELETE FROM loan_history WHERE loan_id IN (${s})`); await client.query(`DELETE FROM Loans WHERE customer_id=$1`, [id]); }
+        await client.query("DELETE FROM Customers WHERE id=$1 AND is_deleted=true", [id]);
+        await client.query('COMMIT'); res.json({ message: "Deleted." });
+    } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Error"); } finally { client.release(); }
 });
 
 app.post('/api/loans/:id/restore', authenticateToken, authorizeManagement, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    // Branch check
     const check = await db.query("SELECT branch_id FROM Loans WHERE id=$1", [id]);
     if (check.rows.length === 0) return res.status(404).send("Not found");
     if (req.user.role !== 'admin' && check.rows[0].branch_id !== req.user.branchId) return res.status(403).send("Denied");
-
-    const customerCheck = await db.query("SELECT c.is_deleted FROM Customers c JOIN Loans l ON l.customer_id = c.id WHERE l.id = $1", [id]);
-    if (customerCheck.rows[0].is_deleted) return res.status(400).json({ error: "Cannot restore loan. Customer is deleted." });
-    
-    const restoreLoanResult = await db.query("UPDATE Loans SET status = 'paid' WHERE id = $1 AND status = 'deleted' RETURNING id, book_loan_number", [id]);
-    res.json({ message: `Loan #${restoreLoanResult.rows[0].book_loan_number} restored.` });
-  } catch (err) { res.status(500).send("Server Error"); }
+    await db.query("UPDATE Loans SET status='paid' WHERE id=$1 AND status='deleted'", [id]);
+    res.json({ message: "Restored." });
+  } catch (err) { res.status(500).send("Error"); }
 });
 
 app.delete('/api/loans/:id/permanent-delete', authenticateToken, authorizeAdmin, async (req, res) => {
-    // Permanent Delete is Admin Only
-    const { id } = req.params;
-    const loanId = parseInt(id);
-    const client = await db.pool.connect();
-    try {
-        await client.query('BEGIN');
-        await client.query("DELETE FROM PledgedItems WHERE loan_id = $1", [loanId]);
-        await client.query("DELETE FROM Transactions WHERE loan_id = $1", [loanId]);
-        await client.query("DELETE FROM loan_history WHERE loan_id = $1", [loanId]);
-        
-        const deleteLoanResult = await client.query("DELETE FROM Loans WHERE id = $1 AND status = 'deleted' RETURNING book_loan_number", [loanId]);
-        if (deleteLoanResult.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: "Deleted loan not found." });
-        }
-        await client.query('COMMIT');
-        res.json({ message: `Loan #${deleteLoanResult.rows[0].book_loan_number} permanently deleted.` });
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(500).send("Server Error");
-    } finally { client.release(); }
+    const id = parseInt(req.params.id); const client = await db.pool.connect();
+    try { await client.query('BEGIN');
+        await client.query("DELETE FROM PledgedItems WHERE loan_id=$1", [id]);
+        await client.query("DELETE FROM Transactions WHERE loan_id=$1", [id]);
+        await client.query("DELETE FROM loan_history WHERE loan_id=$1", [id]);
+        await client.query("DELETE FROM Loans WHERE id=$1 AND status='deleted'", [id]);
+        await client.query('COMMIT'); res.json({ message: "Deleted." });
+    } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Error"); } finally { client.release(); }
 });
 
-// --- RENEW ---
-app.post('/api/loans/:id/renew', authenticateToken, async (req, res) => {
-  const client = await db.pool.connect();
-  const username = req.user.username;
-  try {
-    const oldLoanId = parseInt(req.params.id);
-    const { interestPaid, newBookLoanNumber, newInterestRate } = req.body;
-    await client.query('BEGIN');
-    
-    const oldLoanRes = await client.query("SELECT l.*, pi.* FROM Loans l JOIN PledgedItems pi ON l.id = pi.loan_id WHERE l.id = $1 FOR UPDATE", [oldLoanId]);
-    const oldLoan = oldLoanRes.rows[0];
-    
-    if (req.user.role !== 'admin' && oldLoan.branch_id !== req.user.branchId) {
-          throw new Error("Access Denied.");
-    }
-
-    const txRes = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [oldLoanId]);
-    
-    // Use New Logic
-    const financials = calculateLoanFinancials(oldLoan, txRes.rows);
-    
-    const outstandingInterest = parseFloat(financials.outstandingInterest);
-    const outstandingPrincipal = parseFloat(financials.outstandingPrincipal); 
-
-    const payingNow = parseFloat(interestPaid) || 0;
-    const unpaidInterest = outstandingInterest - payingNow;
-    const interestToCapitalize = unpaidInterest > 0 ? unpaidInterest : 0;
-    
-    const newPrincipalAmount = outstandingPrincipal + interestToCapitalize;
-
-    if (payingNow > 0) await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)", [oldLoanId, payingNow, username]);
-    await client.query("UPDATE Loans SET status = 'renewed', closed_date = NOW() WHERE id = $1", [oldLoanId]);
-
-    const newLoanQuery = `INSERT INTO Loans (customer_id, principal_amount, interest_rate, book_loan_number, appraised_value, pledge_date, due_date, branch_id) VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '1 year', $6) RETURNING id`;
-    const newLoanRes = await client.query(newLoanQuery, [oldLoan.customer_id, newPrincipalAmount, newInterestRate || oldLoan.interest_rate, newBookLoanNumber, oldLoan.appraised_value, oldLoan.branch_id]);
-    
-    const itemQuery = `INSERT INTO PledgedItems (loan_id, item_type, description, quality, weight, gross_weight, net_weight, purity, item_image_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`;
-    await client.query(itemQuery, [newLoanRes.rows[0].id, oldLoan.item_type, oldLoan.description, oldLoan.quality, oldLoan.weight, oldLoan.gross_weight, oldLoan.net_weight, oldLoan.purity, oldLoan.item_image_data]);
-
-    await client.query('COMMIT');
-    res.json({ message: "Renewed", newLoanId: newLoanRes.rows[0].id });
-  } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Server Error"); } finally { client.release(); }
-});
-
-// --- SETTINGS (Admin Only) ---
 app.get('/api/settings', async (req, res) => {
-  try {
-    const result = await db.query("SELECT * FROM business_settings WHERE id = 1");
-    if (result.rows.length > 0) { res.json(result.rows[0]); } 
-    else { res.json({ business_name: 'Sri KuberaLakshmi Bankers' }); }
-  } catch (err) {
-    res.status(500).send("Server Error");
-  }
+  try { const r = await db.query("SELECT * FROM business_settings WHERE id=1"); if(r.rows.length>0) res.json(r.rows[0]); else res.json({ business_name: 'Bankers' }); } catch (err) { res.status(500).send("Error"); }
 });
 
 app.put('/api/settings', authenticateToken, authorizeAdmin, upload.single('logo'), async (req, res) => {
   try {
     const { business_name, address, phone_number, license_number, navbar_display_mode } = req.body;
     let logoUrl = req.body.existingLogoUrl;
-
-    if (req.file) {
-      const b64 = req.file.buffer.toString('base64');
-      const mime = req.file.mimetype;
-      logoUrl = `data:${mime};base64,${b64}`;
-    }
-
-    const displayMode = navbar_display_mode || 'both';
-
-    const query = `
-      INSERT INTO business_settings (id, business_name, address, phone_number, license_number, logo_url, navbar_display_mode, updated_at)
-      VALUES (1, $1, $2, $3, $4, $5, $6, NOW())
-      ON CONFLICT (id) DO UPDATE 
-      SET business_name = $1, address = $2, phone_number = $3, license_number = $4, logo_url = $5, navbar_display_mode = $6, updated_at = NOW()
-      RETURNING *
-    `;
-    
-    const result = await db.query(query, [business_name, address, phone_number, license_number, logoUrl, displayMode]);
-    res.json(result.rows[0]);
-
-  } catch (err) {
-    res.status(500).send("Server Error");
-  }
+    if (req.file) { const b64 = req.file.buffer.toString('base64'); logoUrl = `data:${req.file.mimetype};base64,${b64}`; }
+    const q = `INSERT INTO business_settings (id, business_name, address, phone_number, license_number, logo_url, navbar_display_mode, updated_at) VALUES (1, $1, $2, $3, $4, $5, $6, NOW()) ON CONFLICT (id) DO UPDATE SET business_name=$1, address=$2, phone_number=$3, license_number=$4, logo_url=$5, navbar_display_mode=$6, updated_at=NOW() RETURNING *`;
+    const r = await db.query(q, [business_name, address, phone_number, license_number, logoUrl, navbar_display_mode||'both']);
+    res.json(r.rows[0]);
+  } catch (err) { res.status(500).send("Error"); }
 });
 
-// --- SMART SEARCH (Scoped) ---
 app.get('/api/search', authenticateToken, async (req, res) => {
   try {
-    const { q } = req.query;
-    if (!q || q.trim() === '') return res.json([]);
-    const cleanQuery = `%${q.trim()}%`; 
-
-    const targetBranch = getTargetBranchId(req);
-    const params = [cleanQuery];
-    
-    let loanSql = `SELECT id, book_loan_number, principal_amount, branch_id FROM Loans WHERE book_loan_number ILIKE $1 AND status != 'deleted'`;
-    let custSql = `SELECT id, name, phone_number, branch_id FROM Customers WHERE (name ILIKE $1 OR phone_number ILIKE $1) AND is_deleted = false`;
-
-    if (targetBranch) {
-        loanSql += ` AND branch_id = $2`;
-        custSql += ` AND branch_id = $2`;
-        params.push(targetBranch);
-    }
-    
-    const [loanRes, custRes] = await Promise.all([
-      db.query(loanSql + " LIMIT 3", params),
-      db.query(custSql + " LIMIT 5", params)
-    ]);
-
-    const results = [];
-    loanRes.rows.forEach(loan => {
-      results.push({
-        type: 'loan',
-        id: loan.id,
-        title: `Loan #${loan.book_loan_number}`,
-        subtitle: `₹${loan.principal_amount}`
-      });
-    });
-    custRes.rows.forEach(cust => {
-      results.push({
-        type: 'customer',
-        id: cust.id,
-        title: cust.name,
-        subtitle: cust.phone_number
-      });
-    });
-
-    res.json(results);
-  } catch (err) {
-    res.status(500).send("Server Error");
-  }
+    const { q } = req.query; if (!q || q.trim() === '') return res.json([]);
+    const cq = `%${q.trim()}%`; const targetBranch = getTargetBranchId(req); const p = [cq];
+    let lSql = `SELECT id, book_loan_number, principal_amount, branch_id FROM Loans WHERE book_loan_number ILIKE $1 AND status!='deleted'`;
+    let cSql = `SELECT id, name, phone_number, branch_id FROM Customers WHERE (name ILIKE $1 OR phone_number ILIKE $1) AND is_deleted=false`;
+    if (targetBranch) { lSql += ` AND branch_id=$2`; cSql += ` AND branch_id=$2`; p.push(targetBranch); }
+    const [lR, cR] = await Promise.all([db.query(lSql+" LIMIT 3", p), db.query(cSql+" LIMIT 5", p)]);
+    const resArr = [];
+    lR.rows.forEach(l => resArr.push({ type: 'loan', id: l.id, title: `Loan #${l.book_loan_number}`, subtitle: `₹${l.principal_amount}` }));
+    cR.rows.forEach(c => resArr.push({ type: 'customer', id: c.id, title: c.name, subtitle: c.phone_number }));
+    res.json(resArr);
+  } catch (err) { res.status(500).send("Error"); }
 });
 
 app.listen(PORT, () => {
