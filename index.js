@@ -69,7 +69,6 @@ const getTargetBranchId = (req) => {
 
 const parseDate = (dateInput) => {
   const d = new Date(dateInput);
-  // Force local start of day to prevent UTC rollback
   return new Date(d.getFullYear(), d.getMonth(), d.getDate());
 };
 
@@ -177,8 +176,8 @@ const calculateLoanFinancials = (loan, transactions) => {
   let totalDiscount = 0;
   let breakdown = [];
 
-  // Track interest paid on currently active buckets
   let interestPaidOnCurrentBuckets = 0;
+  let lastInterestPaymentDate = null; 
 
   for (let i = 0; i < processedEvents.length; i++) {
     const event = processedEvents[i];
@@ -195,23 +194,17 @@ const calculateLoanFinancials = (loan, transactions) => {
         });
     }
 
-    // 2. Handle Payments or Report (Calculate Interest)
-    // We also trigger calculation if a disbursement happened, so we can see the "Top-up" row in the worksheet immediately
+    // 2. Handle Payments or Report
     if (event.payment > 0 || event.isReport || event.discount > 0 || event.disburse > 0) {
       let currentSnapshot = 0;
+      let currentRows = []; 
 
       activePrincipals.forEach((p) => {
-        // Only calc interest if this chunk existed BEFORE today's event, OR if it's the Final Report
-        // (This ensures newly added Top-ups get calculated in the final report)
         const isNewChunk = p.startDate.getTime() >= evtDate.getTime();
         
-        // ALLOW calculation for new chunks ONLY if it is the Final Report (to show 1 month accrued)
         if (!isNewChunk || event.isReport) {
           let factor = calculateGoldLoanMonths(p.startDate, evtDate);
           
-          // --- THE FIX: NEW MONEY RULES ---
-          // If it's NOT a "Balance c/f" (meaning it's New Money) AND calculated factor is 0...
-          // Force it to 1.0 (Full Month Interest)
           if (p.label !== "Balance c/f" && factor === 0) {
               factor = 1.0;
           }
@@ -219,18 +212,15 @@ const calculateLoanFinancials = (loan, transactions) => {
           const interest = p.amount * rate * factor;
           currentSnapshot += interest;
           
-          // Show row if interest > 0 OR if it's the Final Report (so we see the active loan status)
           if (interest > 0 || event.isReport) {
-             // Avoid adding duplicate rows for the same date/amount if multiple events happen
-             // We only add to breakdown if it's a Report or a Payment event (not just a disburse event loop)
              if (event.payment > 0 || event.isReport) {
-                 breakdown.push({
+                 currentRows.push({
                    label: `Int. on ${p.amount} (${p.label})`,
                    date: p.startDate.toISOString(),
                    endDate: evtDate.toISOString(),
-                   amount: p.amount.toFixed(2),
-                   months: factor,
-                   interest: interest.toFixed(2),
+                   amount: p.amount,
+                   grossInterest: interest,
+                   rate: rate,
                    status: 'accrued'
                  });
              }
@@ -238,25 +228,61 @@ const calculateLoanFinancials = (loan, transactions) => {
         }
       });
 
-      // Update global snapshot (only if meaningful change, but logic dictates we update)
-      // Note: If we are just processing a disbursement loop, we don't update the MAIN accrued variable used for payments
       if (event.payment > 0 || event.isReport) {
           accruedInterestSnapshot = currentSnapshot;
+      }
+
+      // --- GENERATE BREAKDOWN ROWS ---
+      if (event.payment > 0 || event.isReport) {
+          if (event.isReport && interestPaidOnCurrentBuckets > 0) {
+              let paidRemaining = interestPaidOnCurrentBuckets;
+              currentRows.forEach(row => {
+                  if (paidRemaining > 0) {
+                      const deduction = Math.min(row.grossInterest, paidRemaining);
+                      row.grossInterest -= deduction;
+                      paidRemaining -= deduction;
+                      
+                      if (lastInterestPaymentDate) {
+                          if (new Date(row.date) < lastInterestPaymentDate) {
+                              row.date = lastInterestPaymentDate.toISOString();
+                          }
+                      }
+                  }
+                  
+                  const netMonths = row.grossInterest / (row.amount * row.rate);
+                  row.months = netMonths;
+                  row.interest = row.grossInterest.toFixed(2);
+                  row.amount = row.amount.toFixed(2);
+                  
+                  if (row.grossInterest > 0) breakdown.push(row);
+              });
+          } else {
+              currentRows.forEach(row => {
+                  const netMonths = row.grossInterest / (row.amount * row.rate);
+                  row.months = netMonths;
+                  row.interest = row.grossInterest.toFixed(2);
+                  row.amount = row.amount.toFixed(2);
+                  breakdown.push(row);
+              });
+          }
       }
 
       // 3. Apply Payment
       if (event.payment > 0) {
         let paymentAmount = event.payment;
         
-        // Pay Interest First
         const netInterestOwed = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
         const interestCovered = Math.min(paymentAmount, netInterestOwed);
         
         totalInterestPaid += interestCovered;
         interestPaidOnCurrentBuckets += interestCovered;
+        
+        if (interestCovered > 0) {
+            lastInterestPaymentDate = evtDate; 
+        }
+
         paymentAmount -= interestCovered;
         
-        // Pay Principal Next
         if (paymentAmount > 0) {
           totalPrincipalPaid += paymentAmount;
           
@@ -267,18 +293,17 @@ const calculateLoanFinancials = (loan, transactions) => {
              activePrincipals = [];
              accruedInterestSnapshot = 0;
              interestPaidOnCurrentBuckets = 0;
+             lastInterestPaymentDate = null; 
           } else {
-             // RESET RULE: Defer remaining balance to next month
              const nextMonthDate = addOneMonth(evtDate);
              activePrincipals = [{
                amount: newPrincipalBalance,
                startDate: nextMonthDate,
                label: "Balance c/f"
              }];
-             // Reset interest tracking for the new bucket
-             interestPaidOnCurrentBuckets = 0;
-             // Reset snapshot because we have a new start date
-             accruedInterestSnapshot = 0; 
+             interestPaidOnCurrentBuckets = 0; 
+             accruedInterestSnapshot = 0;
+             lastInterestPaymentDate = null; 
           }
         }
         
@@ -298,10 +323,8 @@ const calculateLoanFinancials = (loan, transactions) => {
 
   const currentPrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
   
-  // Final Interest Calc
-  let finalOutstandingInterest = accruedInterestSnapshot;
   const lastEvent = processedEvents[processedEvents.length-1];
-  
+  let finalOutstandingInterest = 0;
   if (lastEvent.payment > 0) {
       const interestCoveredInLastStep = Math.min(lastEvent.payment, accruedInterestSnapshot);
       finalOutstandingInterest = accruedInterestSnapshot - interestCoveredInLastStep;
@@ -730,10 +753,15 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
 
     if (finalPayment > 0) {
         let interestPart = 0; let principalPart = 0;
-        if (outstandingInterest > 0) {
-            if (finalPayment >= outstandingInterest) { interestPart = outstandingInterest; principalPart = finalPayment - outstandingInterest; } 
+        
+        // NEW: Deduct Discount from Interest Owed First!
+        const netInterestOwed = Math.max(0, outstandingInterest - discount);
+        
+        if (netInterestOwed > 0) {
+            if (finalPayment >= netInterestOwed) { interestPart = netInterestOwed; principalPart = finalPayment - netInterestOwed; } 
             else { interestPart = finalPayment; }
         } else { principalPart = finalPayment; }
+        
         if (interestPart > 0) await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)", [loanId, interestPart, username]);
         if (principalPart > 0) await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3)", [loanId, principalPart, username]);
     }
