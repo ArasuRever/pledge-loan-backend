@@ -121,6 +121,8 @@ const calculateGoldLoanMonths = (startDate, endDate) => {
   return total;
 };
 
+// REPLACE your existing calculateLoanFinancials function with this:
+
 const calculateLoanFinancials = (loan, transactions) => {
   const rate = parseFloat(loan.interest_rate) / 100;
   const today = new Date();
@@ -163,19 +165,13 @@ const calculateLoanFinancials = (loan, transactions) => {
 
   rawEvents.forEach(ev => {
     const dateKey = parseDate(ev.date).getTime();
-    
     if (!eventsMap.has(dateKey)) {
         eventsMap.set(dateKey, {
             date: parseDate(ev.date),
-            disburse: 0,
-            payment: 0,
-            discount: 0,
-            types: new Set(),
-            topupDetails: [] 
+            disburse: 0, payment: 0, discount: 0, types: new Set(), topupDetails: [] 
         });
     }
     const group = eventsMap.get(dateKey);
-    
     if (ev.type === 'disburse') {
         group.disburse += ev.amount;
         group.topupDetails.push({ amount: ev.amount, isInitial: ev.isInitial });
@@ -223,23 +219,20 @@ const calculateLoanFinancials = (loan, transactions) => {
         });
     }
 
-    // 2. Handle Calculations (Accrual)
+    // 2. Accrue Interest
     if (event.payment > 0 || event.isReport || event.discount > 0 || event.disburse > 0) {
       let currentSnapshot = 0;
       let currentRows = []; 
 
       activePrincipals.forEach((p) => {
         const isNewChunk = p.startDate.getTime() >= evtDate.getTime();
-        
         if (!isNewChunk || event.isReport) {
-          // Use the strict 15-day logic
           let factor = calculateGoldLoanMonths(p.startDate, evtDate);
-
           const interest = p.amount * rate * factor;
           currentSnapshot += interest;
           
-          // Only show rows if something is happening (Payment, Report, or Discount)
           if (interest > 0 || event.isReport) {
+             // Only add rows if there is a transaction or report happening
              if (event.payment > 0 || event.isReport || event.discount > 0) {
                  currentRows.push({
                    label: `Int. on ${p.amount} (${p.label})`,
@@ -255,34 +248,29 @@ const calculateLoanFinancials = (loan, transactions) => {
         }
       });
 
-      // Update the snapshot for payment/discount processing
       if (event.payment > 0 || event.isReport || event.discount > 0) {
           accruedInterestSnapshot = currentSnapshot;
       }
 
-      // --- GENERATE ACCRUAL BREAKDOWN ROWS ---
-      // We push accrual rows if there is activity
+      // --- GENERATE ACCRUAL ROWS ---
       if (event.payment > 0 || event.isReport || event.discount > 0) {
-          if (event.isReport && interestPaidOnCurrentBuckets > 0) {
+          // Adjust interest rows based on what has already been paid
+          if (interestPaidOnCurrentBuckets > 0) {
               let paidRemaining = interestPaidOnCurrentBuckets;
               currentRows.forEach(row => {
                   if (paidRemaining > 0) {
                       const deduction = Math.min(row.grossInterest, paidRemaining);
                       row.grossInterest -= deduction;
                       paidRemaining -= deduction;
-                      
-                      if (lastInterestPaymentDate) {
-                          if (new Date(row.date) < lastInterestPaymentDate) {
-                              row.date = lastInterestPaymentDate.toISOString();
-                          }
+                      // Visually shift start date if partially paid
+                      if (lastInterestPaymentDate && new Date(row.date) < lastInterestPaymentDate) {
+                          row.date = lastInterestPaymentDate.toISOString();
                       }
                   }
-                  
                   const netMonths = row.grossInterest / (row.amount * row.rate);
                   row.months = netMonths;
                   row.interest = row.grossInterest.toFixed(2);
                   row.amount = row.amount.toFixed(2);
-                  
                   if (row.grossInterest > 0) breakdown.push(row);
               });
           } else {
@@ -296,11 +284,11 @@ const calculateLoanFinancials = (loan, transactions) => {
           }
       }
 
-      // 3. Apply Discount (NEW LOGIC)
+      // 3. Apply Discount (Fix: Allow Write-off of Principal)
       if (event.discount > 0) {
          totalDiscount += event.discount;
 
-         // Discount "pays" the interest first (Waiver)
+         // A. Cover Interest First
          const netInterestOwed = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
          const discountCoveringInterest = Math.min(event.discount, netInterestOwed);
          
@@ -308,11 +296,33 @@ const calculateLoanFinancials = (loan, transactions) => {
              interestPaidOnCurrentBuckets += discountCoveringInterest;
          }
 
+         // B. Cover Principal (Write-off) with remaining discount
+         const remainingDiscount = event.discount - discountCoveringInterest;
+         if (remainingDiscount > 0) {
+             const totalActive = activePrincipals.reduce((s,p)=>s+p.amount,0);
+             // Determine new balance after write-off
+             const newBal = Math.max(0, totalActive - remainingDiscount);
+             
+             // Update Active Principals
+             if (newBal <= 0.5) {
+                 activePrincipals = []; // Fully settled
+                 accruedInterestSnapshot = 0;
+                 interestPaidOnCurrentBuckets = 0;
+                 lastInterestPaymentDate = null;
+             } else {
+                 const nextMonthDate = addOneMonth(evtDate);
+                 activePrincipals = [{ amount: newBal, startDate: nextMonthDate, label: "Balance c/f" }];
+                 interestPaidOnCurrentBuckets = 0; 
+                 accruedInterestSnapshot = 0;
+                 lastInterestPaymentDate = null; 
+             }
+         }
+
          breakdown.push({
             label: `Discount Applied`,
             amount: (-event.discount).toFixed(2),
             date: evtDate.toISOString(),
-            status: 'payment' // Green styling
+            status: 'payment'
          });
       }
 
@@ -320,22 +330,18 @@ const calculateLoanFinancials = (loan, transactions) => {
       if (event.payment > 0) {
         let paymentAmount = event.payment;
         
-        // Calculate remaining interest after discount
         const netInterestOwed = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
         const interestCovered = Math.min(paymentAmount, netInterestOwed);
         
         totalInterestPaid += interestCovered;
         interestPaidOnCurrentBuckets += interestCovered;
         
-        if (interestCovered > 0) {
-            lastInterestPaymentDate = evtDate; 
-        }
+        if (interestCovered > 0) lastInterestPaymentDate = evtDate; 
 
         paymentAmount -= interestCovered;
         
         if (paymentAmount > 0) {
           totalPrincipalPaid += paymentAmount;
-          
           const totalActivePrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
           const newPrincipalBalance = totalActivePrincipal - paymentAmount;
 
@@ -367,19 +373,12 @@ const calculateLoanFinancials = (loan, transactions) => {
     }
   }
 
+  // Final Calculations
   const currentPrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
-  
-  // Recalculate final interest outstanding
   const lastEvent = processedEvents[processedEvents.length-1];
-  let finalOutstandingInterest = 0;
   
-  if (lastEvent.payment > 0 || lastEvent.discount > 0) {
-      // If we just paid or discounted, the snapshot is current.
-      // Subtract what has been covered (by cash or discount)
-      finalOutstandingInterest = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
-  } else {
-      finalOutstandingInterest = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
-  }
+  // Calculate remaining interest based on final snapshot
+  let finalOutstandingInterest = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
 
   const amountDue = currentPrincipal + finalOutstandingInterest;
 
