@@ -64,7 +64,7 @@ const getTargetBranchId = (req) => {
 };
 
 // ==========================================
-// 🧠 CORE CALCULATION ENGINE (FIXED)
+// 🧠 CORE CALCULATION ENGINE (UPDATED)
 // ==========================================
 
 const parseDate = (dateInput) => {
@@ -72,20 +72,57 @@ const parseDate = (dateInput) => {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate());
 };
 
+// --- NEW LOGIC: STRICT 15-DAY SPLIT & MIN 1 MONTH ---
 const calculateGoldLoanMonths = (startDate, endDate) => {
   const start = parseDate(startDate);
   const end = parseDate(endDate);
-  
-  if (end <= start) return 0.0;
 
-  let months = (end.getFullYear() - start.getFullYear()) * 12;
-  months -= start.getMonth();
-  months += end.getMonth();
+  // 1. Initial Creation / Same Day Rule:
+  // "When a loan is created it should accrue a full months interest"
+  if (end.getTime() <= start.getTime()) return 1.0;
 
-  if (end.getDate() > start.getDate()) {
-    return months + 0.5;
+  // 2. Count Full Months Step-by-Step
+  let tempDate = new Date(start);
+  let fullMonths = 0;
+
+  // Advance by 1 month until we pass the end date
+  while (true) {
+    let nextMonth = new Date(tempDate);
+    nextMonth.setMonth(nextMonth.getMonth() + 1);
+    
+    // Handle end-of-month clipping (e.g. Jan 31 -> Feb 28)
+    if (nextMonth.getDate() !== tempDate.getDate()) {
+       nextMonth.setDate(0); 
+    }
+
+    if (nextMonth > end) break;
+    tempDate = nextMonth;
+    fullMonths++;
   }
-  return months > 0 ? months : 0.0;
+
+  // 3. Calculate Days in the "Partial" Month
+  // tempDate is now the anniversary date just before (or on) the end date.
+  const oneDay = 1000 * 60 * 60 * 24;
+  const diffTime = Math.abs(end - tempDate);
+  const diffDays = Math.ceil(diffTime / oneDay); 
+
+  // 4. Apply 15-Day Rule
+  let extra = 0.0;
+  if (diffDays === 0) {
+      extra = 0.0;
+  } else if (diffDays <= 15) {
+      extra = 0.5;
+  } else {
+      extra = 1.0;
+  }
+
+  let total = fullMonths + extra;
+
+  // 5. Enforce Minimum 1 Month Rule
+  // If the total (e.g., 0.5) is less than 1, round up to 1.0
+  if (total < 1.0) return 1.0;
+
+  return total;
 };
 
 const addOneMonth = (dateObj) => {
@@ -126,6 +163,9 @@ const calculateLoanFinancials = (loan, transactions) => {
       rawEvents.push({ type: 'payment', date: d, amount: amt, originalType: t.payment_type });
     } else if (t.payment_type === 'discount') {
       rawEvents.push({ type: 'discount', date: d, amount: amt });
+    } else if (t.payment_type === 'sale') {
+      // Treat Sale as a payment for calculation purposes
+      rawEvents.push({ type: 'payment', date: d, amount: amt, originalType: 'sale' });
     }
   });
 
@@ -203,11 +243,8 @@ const calculateLoanFinancials = (loan, transactions) => {
         const isNewChunk = p.startDate.getTime() >= evtDate.getTime();
         
         if (!isNewChunk || event.isReport) {
+          // Use the new strict 15-day logic
           let factor = calculateGoldLoanMonths(p.startDate, evtDate);
-          
-          if (p.label !== "Balance c/f" && factor === 0) {
-              factor = 1.0;
-          }
 
           const interest = p.amount * rate * factor;
           currentSnapshot += interest;
@@ -613,6 +650,70 @@ app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => 
     await client.query('COMMIT');
     res.json({ message: `Added ₹${amountToAdd.toFixed(2)}.`, loan: updateResult.rows[0] });
   } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Error."); } finally { client.release(); }
+});
+
+// --- FORFEIT / SELL LOAN ENDPOINT ---
+app.post('/api/loans/:id/forfeit', authenticateToken, upload.fields([{ name: 'signature', maxCount: 1 }, { name: 'photo', maxCount: 1 }]), async (req, res) => {
+  const client = await db.pool.connect();
+  const username = req.user.username;
+  try {
+    const loanId = parseInt(req.params.id);
+    const { salePrice, notes } = req.body; 
+    const finalSalePrice = parseFloat(salePrice) || 0;
+
+    const signatureBuffer = req.files['signature'] ? req.files['signature'][0].buffer : null;
+    const photoBuffer = req.files['photo'] ? req.files['photo'][0].buffer : null;
+
+    await client.query('BEGIN');
+
+    // 1. Validate Loan
+    const loanRes = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
+    if (loanRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Not found." }); }
+    const loan = loanRes.rows[0];
+    
+    if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) { 
+      await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." }); 
+    }
+    if (loan.status !== 'active' && loan.status !== 'overdue') {
+      await client.query('ROLLBACK'); return res.status(400).json({ error: "Loan is not active." }); 
+    }
+
+    // 2. Record the 'Sale' as a transaction
+    if (finalSalePrice > 0) {
+      await client.query(
+        "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'sale', NOW(), $3)",
+        [loanId, finalSalePrice, username]
+      );
+    }
+
+    // 3. Update Loan Status and Save Proofs
+    await client.query(
+      `UPDATE Loans 
+       SET status = 'forfeited', 
+           closed_date = NOW(), 
+           sale_price = $1, 
+           forfeiture_signature_proof = $2, 
+           forfeiture_photo_proof = $3 
+       WHERE id = $4`,
+      [finalSalePrice, signatureBuffer, photoBuffer, loanId]
+    );
+
+    // 4. Log History
+    await client.query(
+      "INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username) VALUES ($1, 'status', $2, 'forfeited', $3)",
+      [loanId, loan.status, username]
+    );
+
+    await client.query('COMMIT');
+    res.json({ message: "Loan forfeited successfully." });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).send("Server Error during forfeiture.");
+  } finally {
+    client.release();
+  }
 });
 
 app.get('/api/loans/:id', authenticateToken, async (req, res) => {
@@ -1069,71 +1170,6 @@ app.get('/api/search', authenticateToken, async (req, res) => {
     cR.rows.forEach(c => resArr.push({ type: 'customer', id: c.id, title: c.name, subtitle: c.phone_number }));
     res.json(resArr);
   } catch (err) { res.status(500).send("Error"); }
-});
-
-// --- FORFEIT / SELL LOAN ENDPOINT ---
-app.post('/api/loans/:id/forfeit', authenticateToken, upload.fields([{ name: 'signature', maxCount: 1 }, { name: 'photo', maxCount: 1 }]), async (req, res) => {
-  const client = await db.pool.connect();
-  const username = req.user.username;
-  try {
-    const loanId = parseInt(req.params.id);
-    const { salePrice, notes } = req.body; // 'salePrice' is the amount the item was sold for
-    const finalSalePrice = parseFloat(salePrice) || 0;
-
-    const signatureBuffer = req.files['signature'] ? req.files['signature'][0].buffer : null;
-    const photoBuffer = req.files['photo'] ? req.files['photo'][0].buffer : null;
-
-    await client.query('BEGIN');
-
-    // 1. Validate Loan
-    const loanRes = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
-    if (loanRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Not found." }); }
-    const loan = loanRes.rows[0];
-    
-    if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) { 
-      await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." }); 
-    }
-    if (loan.status !== 'active' && loan.status !== 'overdue') {
-      await client.query('ROLLBACK'); return res.status(400).json({ error: "Loan is not active." }); 
-    }
-
-    // 2. Record the 'Sale' as a transaction (This balances the books)
-    // We treat the Sale Price as a recovery of funds.
-    if (finalSalePrice > 0) {
-      await client.query(
-        "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'sale', NOW(), $3)",
-        [loanId, finalSalePrice, username]
-      );
-    }
-
-    // 3. Update Loan Status and Save Proofs
-    await client.query(
-      `UPDATE Loans 
-       SET status = 'forfeited', 
-           closed_date = NOW(), 
-           sale_price = $1, 
-           forfeiture_signature_proof = $2, 
-           forfeiture_photo_proof = $3 
-       WHERE id = $4`,
-      [finalSalePrice, signatureBuffer, photoBuffer, loanId]
-    );
-
-    // 4. Log History
-    await client.query(
-      "INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username) VALUES ($1, 'status', $2, 'forfeited', $3)",
-      [loanId, loan.status, username]
-    );
-
-    await client.query('COMMIT');
-    res.json({ message: "Loan forfeited successfully." });
-
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(err);
-    res.status(500).send("Server Error during forfeiture.");
-  } finally {
-    client.release();
-  }
 });
 
 app.listen(PORT, () => {
