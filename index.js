@@ -121,8 +121,6 @@ const calculateGoldLoanMonths = (startDate, endDate) => {
   return total;
 };
 
-// REPLACE your existing calculateLoanFinancials function with this:
-
 const calculateLoanFinancials = (loan, transactions) => {
   const rate = parseFloat(loan.interest_rate) / 100;
   const today = new Date();
@@ -232,7 +230,6 @@ const calculateLoanFinancials = (loan, transactions) => {
           currentSnapshot += interest;
           
           if (interest > 0 || event.isReport) {
-             // Only add rows if there is a transaction or report happening
              if (event.payment > 0 || event.isReport || event.discount > 0) {
                  currentRows.push({
                    label: `Int. on ${p.amount} (${p.label})`,
@@ -254,7 +251,6 @@ const calculateLoanFinancials = (loan, transactions) => {
 
       // --- GENERATE ACCRUAL ROWS ---
       if (event.payment > 0 || event.isReport || event.discount > 0) {
-          // Adjust interest rows based on what has already been paid
           if (interestPaidOnCurrentBuckets > 0) {
               let paidRemaining = interestPaidOnCurrentBuckets;
               currentRows.forEach(row => {
@@ -262,7 +258,6 @@ const calculateLoanFinancials = (loan, transactions) => {
                       const deduction = Math.min(row.grossInterest, paidRemaining);
                       row.grossInterest -= deduction;
                       paidRemaining -= deduction;
-                      // Visually shift start date if partially paid
                       if (lastInterestPaymentDate && new Date(row.date) < lastInterestPaymentDate) {
                           row.date = lastInterestPaymentDate.toISOString();
                       }
@@ -284,11 +279,10 @@ const calculateLoanFinancials = (loan, transactions) => {
           }
       }
 
-      // 3. Apply Discount (Fix: Allow Write-off of Principal)
+      // 3. Apply Discount (Principal Write-off Logic)
       if (event.discount > 0) {
          totalDiscount += event.discount;
 
-         // A. Cover Interest First
          const netInterestOwed = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
          const discountCoveringInterest = Math.min(event.discount, netInterestOwed);
          
@@ -296,16 +290,14 @@ const calculateLoanFinancials = (loan, transactions) => {
              interestPaidOnCurrentBuckets += discountCoveringInterest;
          }
 
-         // B. Cover Principal (Write-off) with remaining discount
+         // Use remaining discount to write off principal
          const remainingDiscount = event.discount - discountCoveringInterest;
          if (remainingDiscount > 0) {
              const totalActive = activePrincipals.reduce((s,p)=>s+p.amount,0);
-             // Determine new balance after write-off
              const newBal = Math.max(0, totalActive - remainingDiscount);
              
-             // Update Active Principals
              if (newBal <= 0.5) {
-                 activePrincipals = []; // Fully settled
+                 activePrincipals = []; // Calculations STOP here
                  accruedInterestSnapshot = 0;
                  interestPaidOnCurrentBuckets = 0;
                  lastInterestPaymentDate = null;
@@ -373,13 +365,8 @@ const calculateLoanFinancials = (loan, transactions) => {
     }
   }
 
-  // Final Calculations
   const currentPrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
-  const lastEvent = processedEvents[processedEvents.length-1];
-  
-  // Calculate remaining interest based on final snapshot
-  let finalOutstandingInterest = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
-
+  const finalOutstandingInterest = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
   const amountDue = currentPrincipal + finalOutstandingInterest;
 
   return {
