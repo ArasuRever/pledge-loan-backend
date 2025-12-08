@@ -797,16 +797,41 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
   const client = await db.pool.connect();
   const username = req.user.username;
   try {
-    const { loan_id, amount_paid, payment_type } = req.body; 
+    // 1. Accept custom_date
+    const { loan_id, amount_paid, payment_type, custom_date } = req.body; 
     const loanId = parseInt(loan_id);
     const paymentAmount = parseFloat(amount_paid);
+    
+    // 2. Parse Date
+    // If custom_date is provided, use it; otherwise use NOW
+    const paymentDate = custom_date ? new Date(custom_date) : new Date();
+    const isBackdated = !!custom_date;
+
     await client.query('BEGIN');
+    
+    // 3. Fetch Loan to check Pledge Date
     const loanCheck = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
     if (loanCheck.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Not found." }); }
     const loan = loanCheck.rows[0];
+    
+    // Check Permissions
     if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) { await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." }); }
 
-    if (payment_type === 'interest') {
+    // --- NEW VALIDATION RULE ---
+    // Ensure payment date is not before the pledge date (ignore time portion)
+    const pledgeDate = new Date(loan.pledge_date);
+    const pDateOnly = new Date(pledgeDate.toDateString());
+    const txDateOnly = new Date(paymentDate.toDateString());
+
+    if (txDateOnly < pDateOnly) {
+       await client.query('ROLLBACK');
+       return res.status(400).json({ error: `Date cannot be before Pledge Date (${loan.pledge_date.toISOString().split('T')[0]})` });
+    }
+
+    // --- SMART SPLIT LOGIC ---
+    // We ONLY use smart split if we are NOT backdating.
+    // Backdating requires manual split because 'outstandingInterest' is calculated as of TODAY, not the past date.
+    if (payment_type === 'interest' && !isBackdated) {
       const txRes = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
       const financials = calculateLoanFinancials(loan, txRes.rows);
       const outstandingInterest = parseFloat(financials.outstandingInterest);
@@ -816,19 +841,27 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
         const principalPart = paymentAmount - interestPart;
         let txs = [];
         if (interestPart > 0) {
-           const r = await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3) RETURNING *", [loanId, interestPart, username]);
+           const r = await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', $3, $4) RETURNING *", [loanId, interestPart, paymentDate, username]);
            txs.push(r.rows[0]);
         }
-        const r2 = await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3) RETURNING *", [loanId, principalPart, username]);
-        txs.push(r2.rows[0]);
+        if (principalPart > 0) {
+            const r2 = await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', $3, $4) RETURNING *", [loanId, principalPart, paymentDate, username]);
+            txs.push(r2.rows[0]);
+        }
         await client.query('COMMIT');
         return res.status(201).json(txs);
       }
     }
-    const newTx = await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, NOW(), $4) RETURNING *", [loanId, paymentAmount, payment_type, username]);
+
+    // Default Insert (Backdated or Standard without split)
+    const newTx = await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, $4, $5) RETURNING *", [loanId, paymentAmount, payment_type, paymentDate, username]);
     await client.query('COMMIT');
     res.status(201).json([newTx.rows[0]]);
-  } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Error"); } finally { client.release(); }
+  } catch (err) { 
+      await client.query('ROLLBACK'); 
+      console.error(err);
+      res.status(500).send("Error"); 
+  } finally { client.release(); }
 });
 
 app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
