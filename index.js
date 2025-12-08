@@ -1071,6 +1071,71 @@ app.get('/api/search', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).send("Error"); }
 });
 
+// --- FORFEIT / SELL LOAN ENDPOINT ---
+app.post('/api/loans/:id/forfeit', authenticateToken, upload.fields([{ name: 'signature', maxCount: 1 }, { name: 'photo', maxCount: 1 }]), async (req, res) => {
+  const client = await db.pool.connect();
+  const username = req.user.username;
+  try {
+    const loanId = parseInt(req.params.id);
+    const { salePrice, notes } = req.body; // 'salePrice' is the amount the item was sold for
+    const finalSalePrice = parseFloat(salePrice) || 0;
+
+    const signatureBuffer = req.files['signature'] ? req.files['signature'][0].buffer : null;
+    const photoBuffer = req.files['photo'] ? req.files['photo'][0].buffer : null;
+
+    await client.query('BEGIN');
+
+    // 1. Validate Loan
+    const loanRes = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
+    if (loanRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Not found." }); }
+    const loan = loanRes.rows[0];
+    
+    if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) { 
+      await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." }); 
+    }
+    if (loan.status !== 'active' && loan.status !== 'overdue') {
+      await client.query('ROLLBACK'); return res.status(400).json({ error: "Loan is not active." }); 
+    }
+
+    // 2. Record the 'Sale' as a transaction (This balances the books)
+    // We treat the Sale Price as a recovery of funds.
+    if (finalSalePrice > 0) {
+      await client.query(
+        "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'sale', NOW(), $3)",
+        [loanId, finalSalePrice, username]
+      );
+    }
+
+    // 3. Update Loan Status and Save Proofs
+    await client.query(
+      `UPDATE Loans 
+       SET status = 'forfeited', 
+           closed_date = NOW(), 
+           sale_price = $1, 
+           forfeiture_signature_proof = $2, 
+           forfeiture_photo_proof = $3 
+       WHERE id = $4`,
+      [finalSalePrice, signatureBuffer, photoBuffer, loanId]
+    );
+
+    // 4. Log History
+    await client.query(
+      "INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username) VALUES ($1, 'status', $2, 'forfeited', $3)",
+      [loanId, loan.status, username]
+    );
+
+    await client.query('COMMIT');
+    res.json({ message: "Loan forfeited successfully." });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).send("Server Error during forfeiture.");
+  } finally {
+    client.release();
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
 });
