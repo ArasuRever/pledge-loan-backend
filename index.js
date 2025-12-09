@@ -138,9 +138,10 @@ const getScopedLoanQuery = (baseQuery, req) => {
 const calculateLoanFinancials = (loan, transactions) => {
   const rate = parseFloat(loan.interest_rate) / 100;
   
-  // Anchor EndDate to Noon
+  // FIX: STOP CALCULATION IF FORFEITED OR PAID
   let endDate = new Date();
-  if (loan.status === 'paid' && loan.closed_date) {
+  // Check if status is paid OR forfeited to freeze calculations at closed_date
+  if ((loan.status === 'paid' || loan.status === 'forfeited') && loan.closed_date) {
       endDate = parseDate(loan.closed_date);
   } else {
       const now = new Date();
@@ -149,7 +150,7 @@ const calculateLoanFinancials = (loan, transactions) => {
 
   let rawEvents = [];
 
-  // Reconstruct Initial Principal
+  // FIX: Reconstruct Initial Principal
   const principalRepaidSum = transactions
     .filter(t => ['principal', 'settlement'].includes(t.payment_type))
     .reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
@@ -161,6 +162,7 @@ const calculateLoanFinancials = (loan, transactions) => {
   const currentBalance = parseFloat(loan.principal_amount);
   const initialPrincipal = currentBalance + principalRepaidSum - topUpSum;
 
+  // FIX: Use parseDate (Noon) for initial event
   if (initialPrincipal > 0.01) {
     rawEvents.push({ 
       type: 'disburse', 
@@ -170,7 +172,7 @@ const calculateLoanFinancials = (loan, transactions) => {
     });
   }
 
-  // Transactions
+  // B. Transactions (Parse to Noon)
   transactions.forEach(t => {
     const d = parseDate(t.payment_date);
     const amt = parseFloat(t.amount_paid);
@@ -186,8 +188,9 @@ const calculateLoanFinancials = (loan, transactions) => {
     }
   });
 
-  // Group Events
+  // C. Group Events by Date
   const eventsMap = new Map();
+
   rawEvents.forEach(ev => {
     const dateKey = ev.date.getTime();
     if (!eventsMap.has(dateKey)) {
@@ -210,20 +213,22 @@ const calculateLoanFinancials = (loan, transactions) => {
 
   const processedEvents = Array.from(eventsMap.values()).sort((a, b) => a.date - b.date);
 
-  // Final Report Event
+  // Add Final Report Event
   processedEvents.push({ 
       date: endDate, 
       isReport: true,
       disburse: 0, payment: 0, discount: 0, types: new Set(), topupDetails: []
   });
 
-  // Calc Loop
+  // --- CALCULATION LOOP ---
   let activePrincipals = []; 
   let accruedInterestSnapshot = 0; 
+  
   let totalPrincipalPaid = 0;
   let totalInterestPaid = 0;
   let totalDiscount = 0;
   let breakdown = [];
+
   let interestPaidOnCurrentBuckets = 0;
   let lastInterestPaymentDate = null; 
 
@@ -239,8 +244,7 @@ const calculateLoanFinancials = (loan, transactions) => {
                 startDate: evtDate, 
                 label: detail.isInitial ? "Initial Principal" : `Top-up`
             });
-
-            // FIX: Add Disbursement to Breakdown
+            // FIX: Add Disbursements to breakdown
             breakdown.push({
                 label: detail.isInitial ? "Principal Disbursed" : "Principal Top-up",
                 amount: detail.amount, 
@@ -282,7 +286,7 @@ const calculateLoanFinancials = (loan, transactions) => {
           accruedInterestSnapshot = currentSnapshot;
       }
 
-      // Generate Accrual Rows
+      // --- GENERATE ACCRUAL ROWS ---
       if (event.payment > 0 || event.isReport || event.discount > 0) {
           if (interestPaidOnCurrentBuckets > 0) {
               let paidRemaining = interestPaidOnCurrentBuckets;
@@ -297,6 +301,7 @@ const calculateLoanFinancials = (loan, transactions) => {
                   }
                   const netMonths = row.grossInterest / (row.amount * row.rate);
                   row.months = netMonths;
+                  // ROUND OFF
                   row.interest = Math.round(row.grossInterest); 
                   row.amount = Math.round(row.amount);
                   if (row.grossInterest > 0) breakdown.push(row);
@@ -305,6 +310,7 @@ const calculateLoanFinancials = (loan, transactions) => {
               currentRows.forEach(row => {
                   const netMonths = row.grossInterest / (row.amount * row.rate);
                   row.months = netMonths;
+                  // ROUND OFF
                   row.interest = Math.round(row.grossInterest);
                   row.amount = Math.round(row.amount);
                   breakdown.push(row);
@@ -317,12 +323,16 @@ const calculateLoanFinancials = (loan, transactions) => {
          totalDiscount += event.discount;
          const netInterestOwed = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
          const discountCoveringInterest = Math.min(event.discount, netInterestOwed);
-         if (discountCoveringInterest > 0) interestPaidOnCurrentBuckets += discountCoveringInterest;
+         
+         if (discountCoveringInterest > 0) {
+             interestPaidOnCurrentBuckets += discountCoveringInterest;
+         }
 
          const remainingDiscount = event.discount - discountCoveringInterest;
          if (remainingDiscount > 0) {
              const totalActive = activePrincipals.reduce((s,p)=>s+p.amount,0);
              const newBal = Math.max(0, totalActive - remainingDiscount);
+             
              if (newBal <= 0.5) {
                  activePrincipals = [];
                  accruedInterestSnapshot = 0;
@@ -335,6 +345,7 @@ const calculateLoanFinancials = (loan, transactions) => {
                  lastInterestPaymentDate = null; 
              }
          }
+
          breakdown.push({
             label: `Discount Applied`,
             amount: Math.round(-event.discount),
@@ -354,6 +365,7 @@ const calculateLoanFinancials = (loan, transactions) => {
         if (interestCovered > 0) lastInterestPaymentDate = evtDate; 
 
         paymentAmount -= interestCovered;
+        
         if (paymentAmount > 0) {
           totalPrincipalPaid += paymentAmount;
           const totalActivePrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
@@ -375,6 +387,7 @@ const calculateLoanFinancials = (loan, transactions) => {
              lastInterestPaymentDate = null; 
           }
         }
+        
         breakdown.push({
           label: `Payment Received (${Array.from(event.types).join('+')})`,
           amount: Math.round(-event.payment),
@@ -743,6 +756,7 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
       SELECT 
         l.id, l.customer_id, l.principal_amount, l.interest_rate, l.book_loan_number, 
         l.status, l.branch_id, l.appraised_value, l.created_at, l.closed_date,
+        l.sale_price, 
         TO_CHAR(l.pledge_date, 'YYYY-MM-DD') as pledge_date, 
         TO_CHAR(l.due_date, 'YYYY-MM-DD') as due_date,
         pi.item_type, pi.description, pi.quality, pi.weight, 
@@ -755,25 +769,19 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
     `;
 
     const loanResult = await db.query(query, [id]);
-    
     if (loanResult.rows.length === 0) return res.status(404).json({ error: "Not found." });
     let loanDetails = loanResult.rows[0];
-    
-    if (req.user.role !== 'admin' && loanDetails.branch_id !== req.user.branchId) {
-        return res.status(403).json({ error: "Access Denied." }); 
-    }
+    if (req.user.role !== 'admin' && loanDetails.branch_id !== req.user.branchId) return res.status(403).json({ error: "Access Denied." });
 
     const transactionsResult = await db.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [id]);
     
     const financials = calculateLoanFinancials(loanDetails, transactionsResult.rows);
 
-    // Image Handling
     if (loanDetails.item_image_data) {
         const b64 = loanDetails.item_image_data.toString('base64');
         const mime = b64.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
         loanDetails.item_image_data_url = `data:${mime};base64,${b64}`;
     } delete loanDetails.item_image_data;
-    
     if (loanDetails.customer_image_url) {
         const b64 = loanDetails.customer_image_url.toString('base64');
         const mime = b64.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
@@ -786,10 +794,7 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
         interestBreakdown: financials.breakdown, 
         calculated: financials
     });
-  } catch (err) { 
-      console.error(err);
-      res.status(500).send("Error"); 
-  }
+  } catch (err) { res.status(500).send("Error"); }
 });
 
 app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req, res) => {
@@ -859,16 +864,21 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
     const isBackdated = !!custom_date;
 
     await client.query('BEGIN');
-    const loanRes = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
-    if (loanRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Not found." }); }
-    const loan = loanRes.rows[0];
+    const loanCheck = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
+    if (loanCheck.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Not found." }); }
+    const loan = loanCheck.rows[0];
     
     if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) { 
         await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." }); 
     }
 
-    // --- FIX 2: DATE VALIDATION ---
-    // Prevent transactions before the loan actually started
+    // --- FIX 2: PREVENT EDITS ON CLOSED LOANS ---
+    if (['paid', 'forfeited'].includes(loan.status)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: "Loan is closed/forfeited. Revert status to add transactions." });
+    }
+
+    // --- FIX 3: DATE VALIDATION ---
     const pledgeDate = new Date(loan.pledge_date);
     const pDateString = pledgeDate.toISOString().split('T')[0];
     const txDateString = paymentDate.toISOString().split('T')[0];
@@ -878,15 +888,17 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
        return res.status(400).json({ error: `Date cannot be before Pledge Date (${pDateString})` });
     }
 
-    // --- FIX 3: HANDLE DISBURSEMENT (TOP-UP) PRINCIPAL UPDATE ---
-    // This was missing! Adding a disbursement must increase the Loan Principal.
+    // --- FIX 4: HANDLE PRINCIPAL UPDATES ---
     if (payment_type === 'disbursement') {
         const newPrincipal = parseFloat(loan.principal_amount) + paymentAmount;
         await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2", [newPrincipal, loanId]);
+    } else if (payment_type === 'principal' || payment_type === 'settlement') {
+        // FIX: Reduce Principal in DB
+        const newPrincipal = Math.max(0, parseFloat(loan.principal_amount) - paymentAmount);
+        await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2", [newPrincipal, loanId]);
     }
 
-    // --- SMART SPLIT LOGIC (Only for Payments, not Disbursements) ---
-    // We skip this if backdating OR if it's a disbursement
+    // --- SMART SPLIT LOGIC (Only for Interest payments that aren't backdated) ---
     if (payment_type === 'interest' && !isBackdated) {
       const txRes = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
       const financials = calculateLoanFinancials(loan, txRes.rows);
@@ -903,6 +915,10 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
         if (principalPart > 0) {
             const r2 = await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', $3, $4) RETURNING *", [loanId, principalPart, paymentDate, username]);
             txs.push(r2.rows[0]);
+            
+            // Handle principal reduction for split
+            const newPrincipal = Math.max(0, parseFloat(loan.principal_amount) - principalPart);
+            await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2", [newPrincipal, loanId]);
         }
         await client.query('COMMIT');
         return res.status(201).json(txs);
@@ -912,7 +928,6 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
     // Default Insert
     const newTx = await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, $4, $5) RETURNING *", [loanId, paymentAmount, payment_type, paymentDate, username]);
     
-    // Log history for manual add
     if (isBackdated) {
         await client.query("INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username) VALUES ($1, 'manual_transaction', 'added', $2, $3)", 
         [loanId, `${payment_type}: ${paymentAmount} on ${txDateString}`, username]);
@@ -949,7 +964,6 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
     if (finalPayment > 0) {
         let interestPart = 0; let principalPart = 0;
         
-        // NEW: Deduct Discount from Interest Owed First!
         const netInterestOwed = Math.max(0, outstandingInterest - discount);
         
         if (netInterestOwed > 0) {
@@ -958,7 +972,12 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
         } else { principalPart = finalPayment; }
         
         if (interestPart > 0) await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)", [loanId, interestPart, username]);
-        if (principalPart > 0) await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3)", [loanId, principalPart, username]);
+        if (principalPart > 0) {
+            await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3)", [loanId, principalPart, username]);
+            // FIX: Principal Update
+            const newPrincipal = Math.max(0, parseFloat(loan.principal_amount) - principalPart);
+            await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2", [newPrincipal, loanId]);
+        }
     }
     if (discount > 0) await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'discount', NOW(), $3)", [loanId, discount, username]);
     await client.query("UPDATE Loans SET status = 'paid', closed_date = NOW() WHERE id = $1", [loanId]);
