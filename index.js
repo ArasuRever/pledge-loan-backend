@@ -67,9 +67,10 @@ const getTargetBranchId = (req) => {
 // 🧠 CORE CALCULATION ENGINE (FIXED)
 // ==========================================
 
+// FIX: Force Noon to prevent Timezone Rollback
 const parseDate = (dateInput) => {
   const d = new Date(dateInput);
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 12, 0, 0);
 };
 
 // --- ROBUST 15-DAY SPLIT & MIN 1 MONTH LOGIC ---
@@ -77,10 +78,8 @@ const calculateGoldLoanMonths = (startDate, endDate) => {
   const start = parseDate(startDate);
   const end = parseDate(endDate);
 
-  // 1. Initial Creation / Same Day Rule:
   if (end.getTime() <= start.getTime()) return 1.0;
 
-  // 2. Count Full Months Step-by-Step
   let tempDate = new Date(start);
   let fullMonths = 0;
 
@@ -88,7 +87,6 @@ const calculateGoldLoanMonths = (startDate, endDate) => {
     let nextMonth = new Date(tempDate);
     nextMonth.setMonth(nextMonth.getMonth() + 1);
     
-    // Handle end-of-month clipping (e.g. Jan 31 -> Feb 28)
     if (nextMonth.getDate() !== tempDate.getDate()) {
        nextMonth.setDate(0); 
     }
@@ -98,12 +96,10 @@ const calculateGoldLoanMonths = (startDate, endDate) => {
     fullMonths++;
   }
 
-  // 3. Calculate Days in the "Partial" Month
   const oneDay = 1000 * 60 * 60 * 24;
   const diffTime = Math.abs(end - tempDate);
   const diffDays = Math.ceil(diffTime / oneDay); 
 
-  // 4. Apply 15-Day Rule
   let extra = 0.0;
   if (diffDays === 0) {
       extra = 0.0;
@@ -115,7 +111,6 @@ const calculateGoldLoanMonths = (startDate, endDate) => {
 
   let total = fullMonths + extra;
 
-  // 5. Enforce Minimum 1 Month Rule
   if (total < 1.0) return 1.0;
 
   return total;
@@ -127,18 +122,13 @@ const getScopedLoanQuery = (baseQuery, req) => {
   const params = [];
   let q = baseQuery;
   
-  // If user is admin, check if they are filtering by a specific branch in the URL query
-  // e.g. ?branchId=2. If 'all' or missing, show everything.
   if (role === 'admin') {
       const qBranch = req.query.branchId;
       if (qBranch && qBranch !== 'all') {
-          // Adjust parameter index based on existing params in baseQuery if any (usually none here)
-          // But safe way for these specific endpoints:
           q += ` AND l.branch_id = $${params.length + 1}`;
           params.push(parseInt(qBranch));
       }
   } else {
-      // Non-admins strictly see their own branch
       q += ` AND l.branch_id = $${params.length + 1}`;
       params.push(branchId);
   }
@@ -147,15 +137,19 @@ const getScopedLoanQuery = (baseQuery, req) => {
 
 const calculateLoanFinancials = (loan, transactions) => {
   const rate = parseFloat(loan.interest_rate) / 100;
-  const today = new Date();
-  const endDate = loan.status === 'paid' && loan.closed_date ? new Date(loan.closed_date) : today;
+  
+  // Anchor EndDate to Noon
+  let endDate = new Date();
+  if (loan.status === 'paid' && loan.closed_date) {
+      endDate = parseDate(loan.closed_date);
+  } else {
+      const now = new Date();
+      endDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12, 0, 0);
+  }
 
   let rawEvents = [];
 
-  // --- FIX: ROBUST INITIAL PRINCIPAL CALCULATION ---
-  // We must reconstruct the Original Principal from the Current Balance.
-  // Formula: Original = Current Balance + Total Principal Repaid - Total Top-ups
-  
+  // Reconstruct Initial Principal
   const principalRepaidSum = transactions
     .filter(t => ['principal', 'settlement'].includes(t.payment_type))
     .reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
@@ -165,23 +159,20 @@ const calculateLoanFinancials = (loan, transactions) => {
     .reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
 
   const currentBalance = parseFloat(loan.principal_amount);
-  
-  // This value should now stay constant regardless of payments
   const initialPrincipal = currentBalance + principalRepaidSum - topUpSum;
 
-  // A. Initial Principal Event (Anchored to Pledge Date)
-  if (initialPrincipal > 0.01) { // Use small threshold for float safety
+  if (initialPrincipal > 0.01) {
     rawEvents.push({ 
       type: 'disburse', 
-      date: new Date(loan.pledge_date), 
+      date: parseDate(loan.pledge_date), 
       amount: initialPrincipal,
       isInitial: true
     });
   }
 
-  // B. Transactions
+  // Transactions
   transactions.forEach(t => {
-    const d = new Date(t.payment_date);
+    const d = parseDate(t.payment_date);
     const amt = parseFloat(t.amount_paid);
     
     if (t.payment_type === 'disbursement') {
@@ -195,14 +186,13 @@ const calculateLoanFinancials = (loan, transactions) => {
     }
   });
 
-  // C. Group Events by Date
+  // Group Events
   const eventsMap = new Map();
-
   rawEvents.forEach(ev => {
-    const dateKey = parseDate(ev.date).getTime();
+    const dateKey = ev.date.getTime();
     if (!eventsMap.has(dateKey)) {
         eventsMap.set(dateKey, {
-            date: parseDate(ev.date),
+            date: ev.date,
             disburse: 0, payment: 0, discount: 0, types: new Set(), topupDetails: [] 
         });
     }
@@ -220,22 +210,20 @@ const calculateLoanFinancials = (loan, transactions) => {
 
   const processedEvents = Array.from(eventsMap.values()).sort((a, b) => a.date - b.date);
 
-  // Add Final Report Event
+  // Final Report Event
   processedEvents.push({ 
-      date: parseDate(endDate), 
+      date: endDate, 
       isReport: true,
       disburse: 0, payment: 0, discount: 0, types: new Set(), topupDetails: []
   });
 
-  // --- CALCULATION LOOP ---
+  // Calc Loop
   let activePrincipals = []; 
   let accruedInterestSnapshot = 0; 
-  
   let totalPrincipalPaid = 0;
   let totalInterestPaid = 0;
   let totalDiscount = 0;
   let breakdown = [];
-
   let interestPaidOnCurrentBuckets = 0;
   let lastInterestPaymentDate = null; 
 
@@ -251,6 +239,14 @@ const calculateLoanFinancials = (loan, transactions) => {
                 startDate: evtDate, 
                 label: detail.isInitial ? "Initial Principal" : `Top-up`
             });
+
+            // FIX: Add Disbursement to Breakdown
+            breakdown.push({
+                label: detail.isInitial ? "Principal Disbursed" : "Principal Top-up",
+                amount: detail.amount, 
+                date: evtDate.toISOString(),
+                status: 'disbursement'
+            });
         });
     }
 
@@ -261,14 +257,13 @@ const calculateLoanFinancials = (loan, transactions) => {
 
       activePrincipals.forEach((p) => {
         const isNewChunk = p.startDate.getTime() >= evtDate.getTime();
-        // Calculate interest if time has passed OR if it's the final report
         if (!isNewChunk || event.isReport) {
           let factor = calculateGoldLoanMonths(p.startDate, evtDate);
           const interest = p.amount * rate * factor;
           currentSnapshot += interest;
           
           if (interest > 0 || event.isReport) {
-             if (event.payment > 0 || event.isReport || event.discount > 0) {
+             if (event.payment > 0 || event.isReport || event.discount > 0 || event.disburse > 0) {
                  currentRows.push({
                    label: `Int. on ${p.amount} (${p.label})`,
                    date: p.startDate.toISOString(),
@@ -287,7 +282,7 @@ const calculateLoanFinancials = (loan, transactions) => {
           accruedInterestSnapshot = currentSnapshot;
       }
 
-      // --- GENERATE ACCRUAL ROWS ---
+      // Generate Accrual Rows
       if (event.payment > 0 || event.isReport || event.discount > 0) {
           if (interestPaidOnCurrentBuckets > 0) {
               let paidRemaining = interestPaidOnCurrentBuckets;
@@ -302,16 +297,16 @@ const calculateLoanFinancials = (loan, transactions) => {
                   }
                   const netMonths = row.grossInterest / (row.amount * row.rate);
                   row.months = netMonths;
-                  row.interest = row.grossInterest.toFixed(2);
-                  row.amount = row.amount.toFixed(2);
+                  row.interest = Math.round(row.grossInterest); 
+                  row.amount = Math.round(row.amount);
                   if (row.grossInterest > 0) breakdown.push(row);
               });
           } else {
               currentRows.forEach(row => {
                   const netMonths = row.grossInterest / (row.amount * row.rate);
                   row.months = netMonths;
-                  row.interest = row.grossInterest.toFixed(2);
-                  row.amount = row.amount.toFixed(2);
+                  row.interest = Math.round(row.grossInterest);
+                  row.amount = Math.round(row.amount);
                   breakdown.push(row);
               });
           }
@@ -322,16 +317,12 @@ const calculateLoanFinancials = (loan, transactions) => {
          totalDiscount += event.discount;
          const netInterestOwed = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
          const discountCoveringInterest = Math.min(event.discount, netInterestOwed);
-         
-         if (discountCoveringInterest > 0) {
-             interestPaidOnCurrentBuckets += discountCoveringInterest;
-         }
+         if (discountCoveringInterest > 0) interestPaidOnCurrentBuckets += discountCoveringInterest;
 
          const remainingDiscount = event.discount - discountCoveringInterest;
          if (remainingDiscount > 0) {
              const totalActive = activePrincipals.reduce((s,p)=>s+p.amount,0);
              const newBal = Math.max(0, totalActive - remainingDiscount);
-             
              if (newBal <= 0.5) {
                  activePrincipals = [];
                  accruedInterestSnapshot = 0;
@@ -344,10 +335,9 @@ const calculateLoanFinancials = (loan, transactions) => {
                  lastInterestPaymentDate = null; 
              }
          }
-
          breakdown.push({
             label: `Discount Applied`,
-            amount: (-event.discount).toFixed(2),
+            amount: Math.round(-event.discount),
             date: evtDate.toISOString(),
             status: 'payment'
          });
@@ -364,7 +354,6 @@ const calculateLoanFinancials = (loan, transactions) => {
         if (interestCovered > 0) lastInterestPaymentDate = evtDate; 
 
         paymentAmount -= interestCovered;
-        
         if (paymentAmount > 0) {
           totalPrincipalPaid += paymentAmount;
           const totalActivePrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
@@ -386,10 +375,9 @@ const calculateLoanFinancials = (loan, transactions) => {
              lastInterestPaymentDate = null; 
           }
         }
-        
         breakdown.push({
           label: `Payment Received (${Array.from(event.types).join('+')})`,
-          amount: (-event.payment).toFixed(2),
+          amount: Math.round(-event.payment),
           date: evtDate.toISOString(),
           status: 'payment'
         });
@@ -402,13 +390,13 @@ const calculateLoanFinancials = (loan, transactions) => {
   const amountDue = currentPrincipal + finalOutstandingInterest;
 
   return {
-    totalInterestOwed: (totalInterestPaid + finalOutstandingInterest).toFixed(2),
-    principalPaid: totalPrincipalPaid.toFixed(2),
-    interestPaid: totalInterestPaid.toFixed(2),
-    totalPaid: (totalPrincipalPaid + totalInterestPaid + totalDiscount).toFixed(2),
-    outstandingPrincipal: currentPrincipal.toFixed(2),
-    outstandingInterest: finalOutstandingInterest.toFixed(2),
-    amountDue: amountDue.toFixed(2),
+    totalInterestOwed: Math.round(totalInterestPaid + finalOutstandingInterest),
+    principalPaid: Math.round(totalPrincipalPaid),
+    interestPaid: Math.round(totalInterestPaid),
+    totalPaid: Math.round(totalPrincipalPaid + totalInterestPaid + totalDiscount),
+    outstandingPrincipal: Math.round(currentPrincipal),
+    outstandingInterest: Math.round(finalOutstandingInterest),
+    amountDue: Math.round(amountDue),
     breakdown: breakdown.reverse()
   };
 };
@@ -749,20 +737,43 @@ app.post('/api/loans/:id/forfeit', authenticateToken, upload.fields([{ name: 'si
 app.get('/api/loans/:id', authenticateToken, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    const loanResult = await db.query("SELECT l.*, pi.item_type, pi.description, pi.quality, pi.weight, pi.gross_weight, pi.net_weight, pi.purity, pi.item_image_data, c.name AS customer_name, c.phone_number, c.address, c.customer_image_url FROM Loans l LEFT JOIN PledgedItems pi ON l.id = pi.loan_id JOIN Customers c ON l.customer_id = c.id WHERE l.id = $1", [id]);
+    
+    // FIX: Use TO_CHAR for dates to prevent Timezone Rollback (force YYYY-MM-DD string)
+    const query = `
+      SELECT 
+        l.id, l.customer_id, l.principal_amount, l.interest_rate, l.book_loan_number, 
+        l.status, l.branch_id, l.appraised_value, l.created_at, l.closed_date,
+        TO_CHAR(l.pledge_date, 'YYYY-MM-DD') as pledge_date, 
+        TO_CHAR(l.due_date, 'YYYY-MM-DD') as due_date,
+        pi.item_type, pi.description, pi.quality, pi.weight, 
+        pi.gross_weight, pi.net_weight, pi.purity, pi.item_image_data, 
+        c.name AS customer_name, c.phone_number, c.address, c.customer_image_url 
+      FROM Loans l 
+      LEFT JOIN PledgedItems pi ON l.id = pi.loan_id 
+      JOIN Customers c ON l.customer_id = c.id 
+      WHERE l.id = $1
+    `;
+
+    const loanResult = await db.query(query, [id]);
+    
     if (loanResult.rows.length === 0) return res.status(404).json({ error: "Not found." });
     let loanDetails = loanResult.rows[0];
-    if (req.user.role !== 'admin' && loanDetails.branch_id !== req.user.branchId) return res.status(403).json({ error: "Access Denied." });
+    
+    if (req.user.role !== 'admin' && loanDetails.branch_id !== req.user.branchId) {
+        return res.status(403).json({ error: "Access Denied." }); 
+    }
 
     const transactionsResult = await db.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [id]);
     
     const financials = calculateLoanFinancials(loanDetails, transactionsResult.rows);
 
+    // Image Handling
     if (loanDetails.item_image_data) {
         const b64 = loanDetails.item_image_data.toString('base64');
         const mime = b64.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
         loanDetails.item_image_data_url = `data:${mime};base64,${b64}`;
     } delete loanDetails.item_image_data;
+    
     if (loanDetails.customer_image_url) {
         const b64 = loanDetails.customer_image_url.toString('base64');
         const mime = b64.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
@@ -775,7 +786,10 @@ app.get('/api/loans/:id', authenticateToken, async (req, res) => {
         interestBreakdown: financials.breakdown, 
         calculated: financials
     });
-  } catch (err) { res.status(500).send("Error"); }
+  } catch (err) { 
+      console.error(err);
+      res.status(500).send("Error"); 
+  }
 });
 
 app.post('/api/loans', authenticateToken, upload.single('itemPhoto'), async (req, res) => {
@@ -1087,7 +1101,14 @@ app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: "Cannot delete: Resulting principal would be negative." }); 
         }
         await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2", [newPrincipal, loanId]);
+    } 
+    // --- ADD THIS BLOCK ---
+    else if (tx.payment_type === 'principal' || tx.payment_type === 'settlement') {
+        // Revert Repayment: ADD the amount back to the loan's principal_amount
+        const newPrincipal = parseFloat(loan.principal_amount) + parseFloat(tx.amount_paid);
+        await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2", [newPrincipal, loanId]);
     }
+    // ---------------------
 
     // 3. Re-open Loan if it was Closed (Paid/Forfeited)
     // Deleting any transaction on a closed loan should essentially re-evaluate it.
