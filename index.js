@@ -121,6 +121,30 @@ const calculateGoldLoanMonths = (startDate, endDate) => {
   return total;
 };
 
+// --- HELPER: Scope Loans by Branch ---
+const getScopedLoanQuery = (baseQuery, req) => {
+  const { role, branchId } = req.user;
+  const params = [];
+  let q = baseQuery;
+  
+  // If user is admin, check if they are filtering by a specific branch in the URL query
+  // e.g. ?branchId=2. If 'all' or missing, show everything.
+  if (role === 'admin') {
+      const qBranch = req.query.branchId;
+      if (qBranch && qBranch !== 'all') {
+          // Adjust parameter index based on existing params in baseQuery if any (usually none here)
+          // But safe way for these specific endpoints:
+          q += ` AND l.branch_id = $${params.length + 1}`;
+          params.push(parseInt(qBranch));
+      }
+  } else {
+      // Non-admins strictly see their own branch
+      q += ` AND l.branch_id = $${params.length + 1}`;
+      params.push(branchId);
+  }
+  return { q, params };
+};
+
 const calculateLoanFinancials = (loan, transactions) => {
   const rate = parseFloat(loan.interest_rate) / 100;
   const today = new Date();
@@ -128,12 +152,25 @@ const calculateLoanFinancials = (loan, transactions) => {
 
   let rawEvents = [];
 
-  // A. Initial Principal
-  const disbursements = transactions.filter(t => t.payment_type === 'disbursement');
-  const topUpSum = disbursements.reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
-  const initialPrincipal = parseFloat(loan.principal_amount) - topUpSum;
+  // --- FIX: ROBUST INITIAL PRINCIPAL CALCULATION ---
+  // We must reconstruct the Original Principal from the Current Balance.
+  // Formula: Original = Current Balance + Total Principal Repaid - Total Top-ups
+  
+  const principalRepaidSum = transactions
+    .filter(t => ['principal', 'settlement'].includes(t.payment_type))
+    .reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
 
-  if (initialPrincipal > 0) {
+  const topUpSum = transactions
+    .filter(t => t.payment_type === 'disbursement')
+    .reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
+
+  const currentBalance = parseFloat(loan.principal_amount);
+  
+  // This value should now stay constant regardless of payments
+  const initialPrincipal = currentBalance + principalRepaidSum - topUpSum;
+
+  // A. Initial Principal Event (Anchored to Pledge Date)
+  if (initialPrincipal > 0.01) { // Use small threshold for float safety
     rawEvents.push({ 
       type: 'disburse', 
       date: new Date(loan.pledge_date), 
@@ -224,6 +261,7 @@ const calculateLoanFinancials = (loan, transactions) => {
 
       activePrincipals.forEach((p) => {
         const isNewChunk = p.startDate.getTime() >= evtDate.getTime();
+        // Calculate interest if time has passed OR if it's the final report
         if (!isNewChunk || event.isReport) {
           let factor = calculateGoldLoanMonths(p.startDate, evtDate);
           const interest = p.amount * rate * factor;
@@ -279,10 +317,9 @@ const calculateLoanFinancials = (loan, transactions) => {
           }
       }
 
-      // 3. Apply Discount (Principal Write-off Logic)
+      // 3. Apply Discount
       if (event.discount > 0) {
          totalDiscount += event.discount;
-
          const netInterestOwed = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
          const discountCoveringInterest = Math.min(event.discount, netInterestOwed);
          
@@ -290,20 +327,18 @@ const calculateLoanFinancials = (loan, transactions) => {
              interestPaidOnCurrentBuckets += discountCoveringInterest;
          }
 
-         // Use remaining discount to write off principal
          const remainingDiscount = event.discount - discountCoveringInterest;
          if (remainingDiscount > 0) {
              const totalActive = activePrincipals.reduce((s,p)=>s+p.amount,0);
              const newBal = Math.max(0, totalActive - remainingDiscount);
              
              if (newBal <= 0.5) {
-                 activePrincipals = []; // Calculations STOP here
+                 activePrincipals = [];
                  accruedInterestSnapshot = 0;
                  interestPaidOnCurrentBuckets = 0;
                  lastInterestPaymentDate = null;
              } else {
-                 const nextMonthDate = addOneMonth(evtDate);
-                 activePrincipals = [{ amount: newBal, startDate: nextMonthDate, label: "Balance c/f" }];
+                 activePrincipals = [{ amount: newBal, startDate: evtDate, label: "Balance c/f" }];
                  interestPaidOnCurrentBuckets = 0; 
                  accruedInterestSnapshot = 0;
                  lastInterestPaymentDate = null; 
@@ -321,13 +356,11 @@ const calculateLoanFinancials = (loan, transactions) => {
       // 4. Apply Payment
       if (event.payment > 0) {
         let paymentAmount = event.payment;
-        
         const netInterestOwed = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
         const interestCovered = Math.min(paymentAmount, netInterestOwed);
         
         totalInterestPaid += interestCovered;
         interestPaidOnCurrentBuckets += interestCovered;
-        
         if (interestCovered > 0) lastInterestPaymentDate = evtDate; 
 
         paymentAmount -= interestCovered;
@@ -343,10 +376,9 @@ const calculateLoanFinancials = (loan, transactions) => {
              interestPaidOnCurrentBuckets = 0;
              lastInterestPaymentDate = null; 
           } else {
-             const nextMonthDate = addOneMonth(evtDate);
              activePrincipals = [{
                amount: newPrincipalBalance,
-               startDate: nextMonthDate,
+               startDate: evtDate,
                label: "Balance c/f"
              }];
              interestPaidOnCurrentBuckets = 0; 
@@ -792,45 +824,55 @@ app.get('/api/customers/:id/loans', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).send("Error"); }
 });
 
-// --- SMART SPLIT LOGIC PRESERVED ---
+// --- SMART SPLIT LOGIC PRESERVED (With Date Fix) ---
 app.post('/api/transactions', authenticateToken, async (req, res) => {
   const client = await db.pool.connect();
   const username = req.user.username;
   try {
-    // 1. Accept custom_date
     const { loan_id, amount_paid, payment_type, custom_date } = req.body; 
     const loanId = parseInt(loan_id);
     const paymentAmount = parseFloat(amount_paid);
     
-    // 2. Parse Date
-    // If custom_date is provided, use it; otherwise use NOW
-    const paymentDate = custom_date ? new Date(custom_date) : new Date();
+    // --- FIX 1: DATE HANDLING ---
+    // If custom_date is provided, force it to Noon to prevent timezone rollback
+    let paymentDate;
+    if (custom_date) {
+        paymentDate = new Date(`${custom_date}T12:00:00`); 
+    } else {
+        paymentDate = new Date();
+    }
+    
     const isBackdated = !!custom_date;
 
     await client.query('BEGIN');
+    const loanRes = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
+    if (loanRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Not found." }); }
+    const loan = loanRes.rows[0];
     
-    // 3. Fetch Loan to check Pledge Date
-    const loanCheck = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
-    if (loanCheck.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Not found." }); }
-    const loan = loanCheck.rows[0];
-    
-    // Check Permissions
-    if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) { await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." }); }
-
-    // --- NEW VALIDATION RULE ---
-    // Ensure payment date is not before the pledge date (ignore time portion)
-    const pledgeDate = new Date(loan.pledge_date);
-    const pDateOnly = new Date(pledgeDate.toDateString());
-    const txDateOnly = new Date(paymentDate.toDateString());
-
-    if (txDateOnly < pDateOnly) {
-       await client.query('ROLLBACK');
-       return res.status(400).json({ error: `Date cannot be before Pledge Date (${loan.pledge_date.toISOString().split('T')[0]})` });
+    if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) { 
+        await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied." }); 
     }
 
-    // --- SMART SPLIT LOGIC ---
-    // We ONLY use smart split if we are NOT backdating.
-    // Backdating requires manual split because 'outstandingInterest' is calculated as of TODAY, not the past date.
+    // --- FIX 2: DATE VALIDATION ---
+    // Prevent transactions before the loan actually started
+    const pledgeDate = new Date(loan.pledge_date);
+    const pDateString = pledgeDate.toISOString().split('T')[0];
+    const txDateString = paymentDate.toISOString().split('T')[0];
+
+    if (new Date(txDateString) < new Date(pDateString)) {
+       await client.query('ROLLBACK');
+       return res.status(400).json({ error: `Date cannot be before Pledge Date (${pDateString})` });
+    }
+
+    // --- FIX 3: HANDLE DISBURSEMENT (TOP-UP) PRINCIPAL UPDATE ---
+    // This was missing! Adding a disbursement must increase the Loan Principal.
+    if (payment_type === 'disbursement') {
+        const newPrincipal = parseFloat(loan.principal_amount) + paymentAmount;
+        await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2", [newPrincipal, loanId]);
+    }
+
+    // --- SMART SPLIT LOGIC (Only for Payments, not Disbursements) ---
+    // We skip this if backdating OR if it's a disbursement
     if (payment_type === 'interest' && !isBackdated) {
       const txRes = await client.query("SELECT * FROM Transactions WHERE loan_id = $1 ORDER BY payment_date ASC", [loanId]);
       const financials = calculateLoanFinancials(loan, txRes.rows);
@@ -853,8 +895,15 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
       }
     }
 
-    // Default Insert (Backdated or Standard without split)
+    // Default Insert
     const newTx = await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, $4, $5) RETURNING *", [loanId, paymentAmount, payment_type, paymentDate, username]);
+    
+    // Log history for manual add
+    if (isBackdated) {
+        await client.query("INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username) VALUES ($1, 'manual_transaction', 'added', $2, $3)", 
+        [loanId, `${payment_type}: ${paymentAmount} on ${txDateString}`, username]);
+    }
+
     await client.query('COMMIT');
     res.status(201).json([newTx.rows[0]]);
   } catch (err) { 
@@ -1005,6 +1054,121 @@ app.get('/api/loans/:id/history', authenticateToken, async (req, res) => {
         const resH = await db.query(q, [loanId]);
         res.json(resH.rows);
     } catch (err) { res.status(500).send("Error"); }
+});
+
+// --- UNDO / DELETE TRANSACTION ---
+app.delete('/api/transactions/:id', authenticateToken, async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const txId = parseInt(req.params.id);
+    await client.query('BEGIN');
+
+    // 1. Get Transaction & Loan Data
+    const txRes = await client.query("SELECT * FROM Transactions WHERE id = $1 FOR UPDATE", [txId]);
+    if (txRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Transaction not found" }); }
+    const tx = txRes.rows[0];
+    const loanId = tx.loan_id;
+
+    const loanRes = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
+    const loan = loanRes.rows[0];
+
+    // Permission Check
+    if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) {
+        await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied" });
+    }
+
+    // 2. Handle Logic based on Type
+    if (tx.payment_type === 'disbursement') {
+        // Revert Principal: Subtract the amount from the loan's principal_amount
+        const newPrincipal = parseFloat(loan.principal_amount) - parseFloat(tx.amount_paid);
+        // Prevent negative principal (sanity check)
+        if (newPrincipal < 0) { 
+            await client.query('ROLLBACK'); 
+            return res.status(400).json({ error: "Cannot delete: Resulting principal would be negative." }); 
+        }
+        await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2", [newPrincipal, loanId]);
+    }
+
+    // 3. Re-open Loan if it was Closed (Paid/Forfeited)
+    // Deleting any transaction on a closed loan should essentially re-evaluate it.
+    if (loan.status === 'paid' || loan.status === 'forfeited') {
+         const dueDate = new Date(loan.due_date);
+         const now = new Date();
+         const newStatus = now > dueDate ? 'overdue' : 'active';
+         
+         await client.query("UPDATE Loans SET status = $1, closed_date = NULL WHERE id = $2", [newStatus, loanId]);
+    }
+
+    // 4. Delete the Record
+    await client.query("DELETE FROM Transactions WHERE id = $1", [txId]);
+
+    // 5. Audit Log
+    await client.query("INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username) VALUES ($1, 'transaction_deleted', $2, 'deleted', $3)", 
+        [loanId, `ID:${txId} Type:${tx.payment_type} Amt:${tx.amount_paid}`, req.user.username]);
+
+    await client.query('COMMIT');
+    res.json({ message: "Transaction deleted successfully." });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: "Failed to delete transaction." });
+  } finally {
+    client.release();
+  }
+});
+
+// --- UNDO FORFEITURE ---
+app.post('/api/loans/:id/undo-forfeit', authenticateToken, async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    const loanId = parseInt(req.params.id);
+    await client.query('BEGIN');
+
+    const loanRes = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [loanId]);
+    if (loanRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Not found" }); }
+    const loan = loanRes.rows[0];
+
+    if (req.user.role !== 'admin' && loan.branch_id !== req.user.branchId) {
+         await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied" });
+    }
+
+    if (loan.status !== 'forfeited') {
+        await client.query('ROLLBACK'); return res.status(400).json({ error: "Loan is not in forfeited state." });
+    }
+
+    // 1. Calculate New Status (Active vs Overdue)
+    const dueDate = new Date(loan.due_date);
+    const now = new Date();
+    const newStatus = now > dueDate ? 'overdue' : 'active';
+
+    // 2. Reset Loan Fields
+    await client.query(`
+        UPDATE Loans 
+        SET status = $1, 
+            closed_date = NULL, 
+            sale_price = NULL, 
+            forfeiture_signature_proof = NULL, 
+            forfeiture_photo_proof = NULL 
+        WHERE id = $2`, 
+        [newStatus, loanId]
+    );
+
+    // 3. Delete the specific 'sale' transaction
+    await client.query("DELETE FROM Transactions WHERE loan_id = $1 AND payment_type = 'sale'", [loanId]);
+
+    // 4. Audit Log
+    await client.query("INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username) VALUES ($1, 'status', 'forfeited', $2, $3)", 
+        [loanId, newStatus, req.user.username]);
+
+    await client.query('COMMIT');
+    res.json({ message: `Forfeiture undone. Loan is now ${newStatus.toUpperCase()}.` });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: "Failed to undo forfeiture." });
+  } finally {
+    client.release();
+  }
 });
 
 app.get('/api/branches', authenticateToken, authorizeManagement, async (req, res) => {
