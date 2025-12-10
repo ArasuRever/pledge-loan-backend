@@ -138,9 +138,8 @@ const getScopedLoanQuery = (baseQuery, req) => {
 const calculateLoanFinancials = (loan, transactions) => {
   const rate = parseFloat(loan.interest_rate) / 100;
   
-  // FIX: STOP CALCULATION IF FORFEITED OR PAID
+  // FIX: Anchor EndDate to Noon & Stop Calculation if Closed
   let endDate = new Date();
-  // Check if status is paid OR forfeited to freeze calculations at closed_date
   if ((loan.status === 'paid' || loan.status === 'forfeited') && loan.closed_date) {
       endDate = parseDate(loan.closed_date);
   } else {
@@ -162,7 +161,6 @@ const calculateLoanFinancials = (loan, transactions) => {
   const currentBalance = parseFloat(loan.principal_amount);
   const initialPrincipal = currentBalance + principalRepaidSum - topUpSum;
 
-  // FIX: Use parseDate (Noon) for initial event
   if (initialPrincipal > 0.01) {
     rawEvents.push({ 
       type: 'disburse', 
@@ -213,7 +211,7 @@ const calculateLoanFinancials = (loan, transactions) => {
 
   const processedEvents = Array.from(eventsMap.values()).sort((a, b) => a.date - b.date);
 
-  // Add Final Report Event
+  // Final Report Event
   processedEvents.push({ 
       date: endDate, 
       isReport: true,
@@ -223,14 +221,11 @@ const calculateLoanFinancials = (loan, transactions) => {
   // --- CALCULATION LOOP ---
   let activePrincipals = []; 
   let accruedInterestSnapshot = 0; 
-  
   let totalPrincipalPaid = 0;
   let totalInterestPaid = 0;
   let totalDiscount = 0;
   let breakdown = [];
-
   let interestPaidOnCurrentBuckets = 0;
-  let lastInterestPaymentDate = null; 
 
   for (let i = 0; i < processedEvents.length; i++) {
     const event = processedEvents[i];
@@ -244,7 +239,6 @@ const calculateLoanFinancials = (loan, transactions) => {
                 startDate: evtDate, 
                 label: detail.isInitial ? "Initial Principal" : `Top-up`
             });
-            // FIX: Add Disbursements to breakdown
             breakdown.push({
                 label: detail.isInitial ? "Principal Disbursed" : "Principal Top-up",
                 amount: detail.amount, 
@@ -260,34 +254,39 @@ const calculateLoanFinancials = (loan, transactions) => {
       let currentRows = []; 
 
       activePrincipals.forEach((p) => {
-        const isNewChunk = p.startDate.getTime() >= evtDate.getTime();
-        if (!isNewChunk || event.isReport) {
+        const isPast = p.startDate.getTime() < evtDate.getTime();
+        const isSameDay = p.startDate.getTime() === evtDate.getTime();
+        const isPaymentEvent = (event.payment > 0 || event.discount > 0);
+
+        // FIX: Allow calculation if time passed OR if it's a Same Day Payment (Renewal/Prepaid)
+        if (isPast || (isSameDay && isPaymentEvent)) {
           let factor = calculateGoldLoanMonths(p.startDate, evtDate);
           const interest = p.amount * rate * factor;
           currentSnapshot += interest;
           
-          if (interest > 0 || event.isReport) {
-             if (event.payment > 0 || event.isReport || event.discount > 0 || event.disburse > 0) {
-                 currentRows.push({
-                   label: `Int. on ${p.amount} (${p.label})`,
-                   date: p.startDate.toISOString(),
-                   endDate: evtDate.toISOString(),
-                   amount: p.amount,
-                   grossInterest: interest,
-                   rate: rate,
-                   status: 'accrued'
-                 });
-             }
+          if (interest > 0) {
+             currentRows.push({
+               label: `Int. on ${p.amount} (${p.label})`,
+               date: p.startDate.toISOString(),
+               endDate: evtDate.toISOString(),
+               amount: p.amount,
+               grossInterest: interest,
+               rate: rate,
+               status: 'accrued'
+             });
+             
+             // FIX: Update start date to avoid double counting, ensuring incremental table rows
+             p.startDate = evtDate; 
           }
         }
       });
 
       if (event.payment > 0 || event.isReport || event.discount > 0) {
-          accruedInterestSnapshot = currentSnapshot;
+          accruedInterestSnapshot += currentSnapshot;
       }
 
-      // --- GENERATE ACCRUAL ROWS ---
-      if (event.payment > 0 || event.isReport || event.discount > 0) {
+      // Generate Accrual Rows
+      if (currentRows.length > 0) {
           if (interestPaidOnCurrentBuckets > 0) {
               let paidRemaining = interestPaidOnCurrentBuckets;
               currentRows.forEach(row => {
@@ -295,22 +294,18 @@ const calculateLoanFinancials = (loan, transactions) => {
                       const deduction = Math.min(row.grossInterest, paidRemaining);
                       row.grossInterest -= deduction;
                       paidRemaining -= deduction;
-                      if (lastInterestPaymentDate && new Date(row.date) < lastInterestPaymentDate) {
-                          row.date = lastInterestPaymentDate.toISOString();
-                      }
                   }
                   const netMonths = row.grossInterest / (row.amount * row.rate);
                   row.months = netMonths;
-                  // ROUND OFF
                   row.interest = Math.round(row.grossInterest); 
                   row.amount = Math.round(row.amount);
                   if (row.grossInterest > 0) breakdown.push(row);
               });
+              interestPaidOnCurrentBuckets = paidRemaining; 
           } else {
               currentRows.forEach(row => {
                   const netMonths = row.grossInterest / (row.amount * row.rate);
                   row.months = netMonths;
-                  // ROUND OFF
                   row.interest = Math.round(row.grossInterest);
                   row.amount = Math.round(row.amount);
                   breakdown.push(row);
@@ -321,31 +316,24 @@ const calculateLoanFinancials = (loan, transactions) => {
       // 3. Apply Discount
       if (event.discount > 0) {
          totalDiscount += event.discount;
-         const netInterestOwed = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
-         const discountCoveringInterest = Math.min(event.discount, netInterestOwed);
+         const netInterestOwed = Math.max(0, accruedInterestSnapshot);
          
+         const discountCoveringInterest = Math.min(event.discount, netInterestOwed);
          if (discountCoveringInterest > 0) {
-             interestPaidOnCurrentBuckets += discountCoveringInterest;
+             accruedInterestSnapshot -= discountCoveringInterest;
          }
 
          const remainingDiscount = event.discount - discountCoveringInterest;
          if (remainingDiscount > 0) {
              const totalActive = activePrincipals.reduce((s,p)=>s+p.amount,0);
              const newBal = Math.max(0, totalActive - remainingDiscount);
-             
              if (newBal <= 0.5) {
                  activePrincipals = [];
                  accruedInterestSnapshot = 0;
-                 interestPaidOnCurrentBuckets = 0;
-                 lastInterestPaymentDate = null;
              } else {
                  activePrincipals = [{ amount: newBal, startDate: evtDate, label: "Balance c/f" }];
-                 interestPaidOnCurrentBuckets = 0; 
-                 accruedInterestSnapshot = 0;
-                 lastInterestPaymentDate = null; 
              }
          }
-
          breakdown.push({
             label: `Discount Applied`,
             amount: Math.round(-event.discount),
@@ -357,13 +345,10 @@ const calculateLoanFinancials = (loan, transactions) => {
       // 4. Apply Payment
       if (event.payment > 0) {
         let paymentAmount = event.payment;
-        const netInterestOwed = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
-        const interestCovered = Math.min(paymentAmount, netInterestOwed);
         
+        const interestCovered = Math.min(paymentAmount, accruedInterestSnapshot);
         totalInterestPaid += interestCovered;
-        interestPaidOnCurrentBuckets += interestCovered;
-        if (interestCovered > 0) lastInterestPaymentDate = evtDate; 
-
+        accruedInterestSnapshot -= interestCovered;
         paymentAmount -= interestCovered;
         
         if (paymentAmount > 0) {
@@ -374,17 +359,12 @@ const calculateLoanFinancials = (loan, transactions) => {
           if (newPrincipalBalance <= 0.5) { 
              activePrincipals = [];
              accruedInterestSnapshot = 0;
-             interestPaidOnCurrentBuckets = 0;
-             lastInterestPaymentDate = null; 
           } else {
              activePrincipals = [{
                amount: newPrincipalBalance,
-               startDate: evtDate,
+               startDate: evtDate, 
                label: "Balance c/f"
              }];
-             interestPaidOnCurrentBuckets = 0; 
-             accruedInterestSnapshot = 0;
-             lastInterestPaymentDate = null; 
           }
         }
         
@@ -399,7 +379,7 @@ const calculateLoanFinancials = (loan, transactions) => {
   }
 
   const currentPrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
-  const finalOutstandingInterest = Math.max(0, accruedInterestSnapshot - interestPaidOnCurrentBuckets);
+  const finalOutstandingInterest = accruedInterestSnapshot;
   const amountDue = currentPrincipal + finalOutstandingInterest;
 
   return {
@@ -683,6 +663,103 @@ app.post('/api/loans/:id/add-principal', authenticateToken, async (req, res) => 
   } catch (err) { await client.query('ROLLBACK'); res.status(500).send("Error."); } finally { client.release(); }
 });
 
+// --- RENEW LOAN ENDPOINT (FIXED) ---
+app.post('/api/loans/:id/renew', authenticateToken, async (req, res) => {
+  const client = await db.pool.connect();
+  const username = req.user.username;
+  try {
+    const oldLoanId = parseInt(req.params.id);
+    const { newBookLoanNumber, interestPaid, principalPaid, principalAdded, newInterestRate, newPrincipal, deductFirstMonthInterest } = req.body;
+    
+    const intPaid = parseFloat(interestPaid) || 0;
+    const prinPaid = parseFloat(principalPaid) || 0;
+    const prinAdded = parseFloat(principalAdded) || 0;
+    const finalNewPrincipal = parseFloat(newPrincipal);
+    const newRate = parseFloat(newInterestRate);
+
+    if (!newBookLoanNumber || isNaN(finalNewPrincipal) || isNaN(newRate)) {
+        return res.status(400).json({ error: "Invalid renewal data." });
+    }
+
+    await client.query('BEGIN');
+
+    // 1. Fetch Old Loan & Item
+    const oldLoanRes = await client.query("SELECT * FROM Loans WHERE id = $1 FOR UPDATE", [oldLoanId]);
+    if (oldLoanRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: "Loan not found" }); }
+    const oldLoan = oldLoanRes.rows[0];
+
+    if (req.user.role !== 'admin' && oldLoan.branch_id !== req.user.branchId) {
+        await client.query('ROLLBACK'); return res.status(403).json({ error: "Access Denied" });
+    }
+    if (oldLoan.status !== 'active' && oldLoan.status !== 'overdue') {
+        await client.query('ROLLBACK'); return res.status(400).json({ error: "Loan must be active/overdue to renew." });
+    }
+
+    // 2. Log Payments/Disbursements on Old Loan
+    if (intPaid > 0) {
+        await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)", [oldLoanId, intPaid, username]);
+    }
+    if (prinPaid > 0) {
+        await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3)", [oldLoanId, prinPaid, username]);
+    }
+    
+    // --- FIX: Handle Top-up Logic Correctly ---
+    if (prinAdded > 0) {
+        // A. Log transaction
+        await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'disbursement', NOW(), $3)", [oldLoanId, prinAdded, username]);
+        
+        // B. UPDATE OLD LOAN PRINCIPAL (Critical for historical accuracy)
+        const updatedOldPrincipal = parseFloat(oldLoan.principal_amount) + prinAdded;
+        await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2", [updatedOldPrincipal, oldLoanId]);
+    }
+
+    // 3. Close Old Loan
+    await client.query("UPDATE Loans SET status = 'paid', closed_date = NOW() WHERE id = $1", [oldLoanId]);
+    await client.query("INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username) VALUES ($1, 'status', 'renewed', $2, $3)", [oldLoanId, `Renewed to ${newBookLoanNumber}`, username]);
+
+    // 4. Create New Loan
+    const newLoanRes = await client.query(
+        `INSERT INTO Loans (customer_id, principal_amount, interest_rate, book_loan_number, pledge_date, due_date, status, branch_id, appraised_value) 
+         VALUES ($1, $2, $3, $4, NOW(), NOW() + INTERVAL '1 year', 'active', $5, $6) RETURNING id`,
+        [oldLoan.customer_id, finalNewPrincipal, newRate, newBookLoanNumber, oldLoan.branch_id, oldLoan.appraised_value]
+    );
+    const newLoanId = newLoanRes.rows[0].id;
+
+    // 5. Copy Pledged Item
+    const itemRes = await client.query("SELECT * FROM PledgedItems WHERE loan_id = $1", [oldLoanId]);
+    if (itemRes.rows.length > 0) {
+        const item = itemRes.rows[0];
+        await client.query(
+            `INSERT INTO PledgedItems (loan_id, item_type, description, quality, weight, gross_weight, net_weight, purity, item_image_data) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [newLoanId, item.item_type, item.description, item.quality, item.weight, item.gross_weight, item.net_weight, item.purity, item.item_image_data]
+        );
+    }
+
+    // 6. Handle First Month Interest Deduction (New Loan)
+    if (deductFirstMonthInterest === true || deductFirstMonthInterest === 'true') {
+        const firstMonthInt = finalNewPrincipal * (newRate / 100);
+        if (firstMonthInt > 0) {
+            await client.query(
+                "INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)", 
+                [newLoanId, firstMonthInt, username]
+            );
+        }
+    }
+
+    await client.query('COMMIT');
+    res.json({ message: "Loan Renewed Successfully!", newLoanId: newLoanId });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    if (err.code === '23505') return res.status(400).json({ error: "New Book Loan Number already exists." });
+    res.status(500).json({ error: "Renewal failed." });
+  } finally {
+    client.release();
+  }
+});
+
 // --- FORFEIT / SELL LOAN ENDPOINT ---
 app.post('/api/loans/:id/forfeit', authenticateToken, upload.fields([{ name: 'signature', maxCount: 1 }, { name: 'photo', maxCount: 1 }]), async (req, res) => {
   const client = await db.pool.connect();
@@ -928,6 +1005,7 @@ app.post('/api/transactions', authenticateToken, async (req, res) => {
     // Default Insert
     const newTx = await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, $3, $4, $5) RETURNING *", [loanId, paymentAmount, payment_type, paymentDate, username]);
     
+    // Log history for manual add
     if (isBackdated) {
         await client.query("INSERT INTO loan_history (loan_id, field_changed, old_value, new_value, changed_by_username) VALUES ($1, 'manual_transaction', 'added', $2, $3)", 
         [loanId, `${payment_type}: ${paymentAmount} on ${txDateString}`, username]);
@@ -964,6 +1042,7 @@ app.post('/api/loans/:id/settle', authenticateToken, async (req, res) => {
     if (finalPayment > 0) {
         let interestPart = 0; let principalPart = 0;
         
+        // NEW: Deduct Discount from Interest Owed First!
         const netInterestOwed = Math.max(0, outstandingInterest - discount);
         
         if (netInterestOwed > 0) {
