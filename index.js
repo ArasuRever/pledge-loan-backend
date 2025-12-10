@@ -138,7 +138,7 @@ const getScopedLoanQuery = (baseQuery, req) => {
 const calculateLoanFinancials = (loan, transactions) => {
   const rate = parseFloat(loan.interest_rate) / 100;
   
-  // FIX: Anchor EndDate to Noon & Stop Calculation if Closed
+  // Anchor EndDate to Noon
   let endDate = new Date();
   if ((loan.status === 'paid' || loan.status === 'forfeited') && loan.closed_date) {
       endDate = parseDate(loan.closed_date);
@@ -149,7 +149,7 @@ const calculateLoanFinancials = (loan, transactions) => {
 
   let rawEvents = [];
 
-  // FIX: Reconstruct Initial Principal
+  // Reconstruct Initial Principal
   const principalRepaidSum = transactions
     .filter(t => ['principal', 'settlement'].includes(t.payment_type))
     .reduce((sum, t) => sum + parseFloat(t.amount_paid), 0);
@@ -170,7 +170,7 @@ const calculateLoanFinancials = (loan, transactions) => {
     });
   }
 
-  // B. Transactions (Parse to Noon)
+  // Transactions
   transactions.forEach(t => {
     const d = parseDate(t.payment_date);
     const amt = parseFloat(t.amount_paid);
@@ -186,9 +186,8 @@ const calculateLoanFinancials = (loan, transactions) => {
     }
   });
 
-  // C. Group Events by Date
+  // Group Events
   const eventsMap = new Map();
-
   rawEvents.forEach(ev => {
     const dateKey = ev.date.getTime();
     if (!eventsMap.has(dateKey)) {
@@ -218,7 +217,8 @@ const calculateLoanFinancials = (loan, transactions) => {
       disburse: 0, payment: 0, discount: 0, types: new Set(), topupDetails: []
   });
 
-  // --- CALCULATION LOOP ---
+  // --- CUMULATIVE CALCULATION LOOP ---
+  // We track 'accruedSoFar' for each principal chunk to determine the Delta.
   let activePrincipals = []; 
   let accruedInterestSnapshot = 0; 
   let totalPrincipalPaid = 0;
@@ -237,6 +237,7 @@ const calculateLoanFinancials = (loan, transactions) => {
             activePrincipals.push({ 
                 amount: detail.amount, 
                 startDate: evtDate, 
+                accruedSoFar: 0, // Track how much interest this chunk has generated
                 label: detail.isInitial ? "Initial Principal" : `Top-up`
             });
             breakdown.push({
@@ -248,133 +249,143 @@ const calculateLoanFinancials = (loan, transactions) => {
         });
     }
 
-    // 2. Accrue Interest
-    if (event.payment > 0 || event.isReport || event.discount > 0 || event.disburse > 0) {
-      let currentSnapshot = 0;
-      let currentRows = []; 
+    // 2. Accrue Interest (Cumulative Check)
+    let currentRows = [];
+    
+    activePrincipals.forEach((p) => {
+        // Calculate Total Expected Interest from Start to Now
+        const totalMonths = calculateGoldLoanMonths(p.startDate, evtDate);
+        const totalExpectedInterest = p.amount * rate * totalMonths;
+        
+        // The Delta is what we need to add now
+        let deltaInterest = totalExpectedInterest - p.accruedSoFar;
+        
+        // Floating point safety
+        if (deltaInterest < 0.01) deltaInterest = 0;
 
-      activePrincipals.forEach((p) => {
-        const isPast = p.startDate.getTime() < evtDate.getTime();
-        const isSameDay = p.startDate.getTime() === evtDate.getTime();
-        const isPaymentEvent = (event.payment > 0 || event.discount > 0);
+        if (deltaInterest > 0) {
+            currentRows.push({
+                label: `Int. on ${p.amount} (${p.label})`,
+                date: p.startDate.toISOString(), // Keep original start date for reference
+                endDate: evtDate.toISOString(),
+                amount: p.amount,
+                grossInterest: deltaInterest,
+                rate: rate,
+                status: 'accrued'
+            });
+            
+            // Update tracking
+            p.accruedSoFar += deltaInterest;
+            accruedInterestSnapshot += deltaInterest;
+        }
+    });
 
-        // FIX: Allow calculation if time passed OR if it's a Same Day Payment (Renewal/Prepaid)
-        if (isPast || (isSameDay && isPaymentEvent)) {
-          let factor = calculateGoldLoanMonths(p.startDate, evtDate);
-          const interest = p.amount * rate * factor;
-          currentSnapshot += interest;
-          
-          if (interest > 0) {
-             currentRows.push({
-               label: `Int. on ${p.amount} (${p.label})`,
-               date: p.startDate.toISOString(),
-               endDate: evtDate.toISOString(),
-               amount: p.amount,
-               grossInterest: interest,
-               rate: rate,
-               status: 'accrued'
+    // Generate Accrual Rows for UI
+    if (currentRows.length > 0) {
+        if (interestPaidOnCurrentBuckets > 0) {
+             let paidRemaining = interestPaidOnCurrentBuckets;
+             currentRows.forEach(row => {
+                 if (paidRemaining > 0) {
+                     const deduction = Math.min(row.grossInterest, paidRemaining);
+                     row.grossInterest -= deduction;
+                     paidRemaining -= deduction;
+                 }
+                 const netMonths = row.grossInterest / (row.amount * row.rate);
+                 row.months = netMonths;
+                 row.interest = Math.round(row.grossInterest); 
+                 row.amount = Math.round(row.amount);
+                 if (row.grossInterest > 0) breakdown.push(row);
              });
-             
-             // FIX: Update start date to avoid double counting, ensuring incremental table rows
-             p.startDate = evtDate; 
-          }
+             interestPaidOnCurrentBuckets = paidRemaining;
+        } else {
+             currentRows.forEach(row => {
+                 const netMonths = row.grossInterest / (row.amount * row.rate);
+                 row.months = netMonths;
+                 row.interest = Math.round(row.grossInterest);
+                 row.amount = Math.round(row.amount);
+                 breakdown.push(row);
+             });
         }
-      });
+    }
 
-      if (event.payment > 0 || event.isReport || event.discount > 0) {
-          accruedInterestSnapshot += currentSnapshot;
-      }
-
-      // Generate Accrual Rows
-      if (currentRows.length > 0) {
-          if (interestPaidOnCurrentBuckets > 0) {
-              let paidRemaining = interestPaidOnCurrentBuckets;
-              currentRows.forEach(row => {
-                  if (paidRemaining > 0) {
-                      const deduction = Math.min(row.grossInterest, paidRemaining);
-                      row.grossInterest -= deduction;
-                      paidRemaining -= deduction;
-                  }
-                  const netMonths = row.grossInterest / (row.amount * row.rate);
-                  row.months = netMonths;
-                  row.interest = Math.round(row.grossInterest); 
-                  row.amount = Math.round(row.amount);
-                  if (row.grossInterest > 0) breakdown.push(row);
-              });
-              interestPaidOnCurrentBuckets = paidRemaining; 
-          } else {
-              currentRows.forEach(row => {
-                  const netMonths = row.grossInterest / (row.amount * row.rate);
-                  row.months = netMonths;
-                  row.interest = Math.round(row.grossInterest);
-                  row.amount = Math.round(row.amount);
-                  breakdown.push(row);
-              });
-          }
-      }
-
-      // 3. Apply Discount
-      if (event.discount > 0) {
-         totalDiscount += event.discount;
-         const netInterestOwed = Math.max(0, accruedInterestSnapshot);
-         
-         const discountCoveringInterest = Math.min(event.discount, netInterestOwed);
-         if (discountCoveringInterest > 0) {
-             accruedInterestSnapshot -= discountCoveringInterest;
-         }
-
-         const remainingDiscount = event.discount - discountCoveringInterest;
-         if (remainingDiscount > 0) {
-             const totalActive = activePrincipals.reduce((s,p)=>s+p.amount,0);
-             const newBal = Math.max(0, totalActive - remainingDiscount);
-             if (newBal <= 0.5) {
-                 activePrincipals = [];
-                 accruedInterestSnapshot = 0;
-             } else {
-                 activePrincipals = [{ amount: newBal, startDate: evtDate, label: "Balance c/f" }];
-             }
-         }
-         breakdown.push({
-            label: `Discount Applied`,
-            amount: Math.round(-event.discount),
-            date: evtDate.toISOString(),
-            status: 'payment'
-         });
-      }
-
-      // 4. Apply Payment
-      if (event.payment > 0) {
-        let paymentAmount = event.payment;
+    // 3. Apply Discount
+    if (event.discount > 0) {
+        totalDiscount += event.discount;
+        const netInterestOwed = Math.max(0, accruedInterestSnapshot);
+        const discountCoveringInterest = Math.min(event.discount, netInterestOwed);
         
-        const interestCovered = Math.min(paymentAmount, accruedInterestSnapshot);
-        totalInterestPaid += interestCovered;
-        accruedInterestSnapshot -= interestCovered;
-        paymentAmount -= interestCovered;
-        
-        if (paymentAmount > 0) {
-          totalPrincipalPaid += paymentAmount;
-          const totalActivePrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
-          const newPrincipalBalance = totalActivePrincipal - paymentAmount;
-
-          if (newPrincipalBalance <= 0.5) { 
-             activePrincipals = [];
-             accruedInterestSnapshot = 0;
-          } else {
-             activePrincipals = [{
-               amount: newPrincipalBalance,
-               startDate: evtDate, 
-               label: "Balance c/f"
-             }];
-          }
+        if (discountCoveringInterest > 0) {
+            accruedInterestSnapshot -= discountCoveringInterest;
+            // Distribute discount reduction across active principals 'accruedSoFar' 
+            // so we don't re-accrue it. 
+            // (Simplification: We reduce the snapshot, but keep p.accruedSoFar high. 
+            // This means Future Delta = NewTotal - OldHigh. It works.)
         }
-        
+
+        const remainingDiscount = event.discount - discountCoveringInterest;
+        if (remainingDiscount > 0) {
+            // Principal Reduction via Discount
+            const totalActive = activePrincipals.reduce((s,p)=>s+p.amount,0);
+            const newBal = Math.max(0, totalActive - remainingDiscount);
+            if (newBal <= 0.5) {
+                activePrincipals = [];
+                accruedInterestSnapshot = 0;
+            } else {
+                // Reset to single chunk for simplicity after principal change
+                activePrincipals = [{ 
+                    amount: newBal, 
+                    startDate: evtDate, 
+                    accruedSoFar: 0, // Reset accrual tracking for new balance
+                    label: "Balance c/f" 
+                }];
+                // Immediate accrual on new balance? 
+                // calculateGoldLoanMonths(evtDate, evtDate) = 1.0.
+                // So next loop will charge 1 month immediately on this new balance.
+                // This aligns with "New loan/balance = New interest" logic.
+            }
+        }
         breakdown.push({
-          label: `Payment Received (${Array.from(event.types).join('+')})`,
-          amount: Math.round(-event.payment),
-          date: evtDate.toISOString(),
-          status: 'payment'
+           label: `Discount Applied`,
+           amount: Math.round(-event.discount),
+           date: evtDate.toISOString(),
+           status: 'payment'
         });
+    }
+
+    // 4. Apply Payment
+    if (event.payment > 0) {
+      let paymentAmount = event.payment;
+      
+      const interestCovered = Math.min(paymentAmount, accruedInterestSnapshot);
+      totalInterestPaid += interestCovered;
+      accruedInterestSnapshot -= interestCovered;
+      paymentAmount -= interestCovered;
+      
+      if (paymentAmount > 0) {
+        totalPrincipalPaid += paymentAmount;
+        const totalActivePrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
+        const newPrincipalBalance = totalActivePrincipal - paymentAmount;
+
+        if (newPrincipalBalance <= 0.5) { 
+           activePrincipals = [];
+           accruedInterestSnapshot = 0;
+        } else {
+           // Consolidate remaining principal
+           activePrincipals = [{
+             amount: newPrincipalBalance,
+             startDate: evtDate, 
+             accruedSoFar: 0, // Reset accrual for new principal base
+             label: "Balance c/f"
+           }];
+        }
       }
+      
+      breakdown.push({
+        label: `Payment Received (${Array.from(event.types).join('+')})`,
+        amount: Math.round(-event.payment),
+        date: evtDate.toISOString(),
+        status: 'payment'
+      });
     }
   }
 
