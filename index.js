@@ -74,11 +74,13 @@ const parseDate = (dateInput) => {
 };
 
 // --- ROBUST 15-DAY SPLIT & MIN 1 MONTH LOGIC ---
-const calculateGoldLoanMonths = (startDate, endDate) => {
+const calculateGoldLoanMonths = (startDate, endDate, isCarryOver = false) => {
   const start = parseDate(startDate);
   const end = parseDate(endDate);
 
-  if (end.getTime() <= start.getTime()) return 1.0;
+  if (end.getTime() <= start.getTime()) {
+      return isCarryOver ? 0.0 : 1.0;
+  }
 
   let tempDate = new Date(start);
   let fullMonths = 0;
@@ -111,7 +113,7 @@ const calculateGoldLoanMonths = (startDate, endDate) => {
 
   let total = fullMonths + extra;
 
-  if (total < 1.0) return 1.0;
+  if (!isCarryOver && total < 1.0) return 1.0;
 
   return total;
 };
@@ -175,6 +177,10 @@ const calculateLoanFinancials = (loan, transactions) => {
     const d = parseDate(t.payment_date);
     const amt = parseFloat(t.amount_paid);
     
+    if ((loan.status === 'paid' || loan.status === 'forfeited') && d > endDate) {
+       return; 
+    }
+    
     if (t.payment_type === 'disbursement') {
       rawEvents.push({ type: 'disburse', date: d, amount: amt });
     } else if (['interest', 'principal', 'settlement'].includes(t.payment_type)) {
@@ -237,8 +243,10 @@ const calculateLoanFinancials = (loan, transactions) => {
             activePrincipals.push({ 
                 amount: detail.amount, 
                 startDate: evtDate, 
-                accruedSoFar: 0, // Track how much interest this chunk has generated
-                label: detail.isInitial ? "Initial Principal" : `Top-up`
+                accruedSoFar: 0, 
+                label: detail.isInitial ? "Initial Principal" : `Top-up`,
+                isCarryOver: false,
+                lastAccruedDate: evtDate // <--- TRACKER: Starts at Disbursement Date
             });
             breakdown.push({
                 label: detail.isInitial ? "Principal Disbursed" : "Principal Top-up",
@@ -253,20 +261,17 @@ const calculateLoanFinancials = (loan, transactions) => {
     let currentRows = [];
     
     activePrincipals.forEach((p) => {
-        // Calculate Total Expected Interest from Start to Now
-        const totalMonths = calculateGoldLoanMonths(p.startDate, evtDate);
+        const totalMonths = calculateGoldLoanMonths(p.startDate, evtDate, p.isCarryOver);
         const totalExpectedInterest = p.amount * rate * totalMonths;
         
-        // The Delta is what we need to add now
         let deltaInterest = totalExpectedInterest - p.accruedSoFar;
         
-        // Floating point safety
         if (deltaInterest < 0.01) deltaInterest = 0;
 
         if (deltaInterest > 0) {
             currentRows.push({
                 label: `Int. on ${p.amount} (${p.label})`,
-                date: p.startDate.toISOString(), // Keep original start date for reference
+                date: p.lastAccruedDate.toISOString(), // <--- USE LAST CHECKPOINT for Display
                 endDate: evtDate.toISOString(),
                 amount: p.amount,
                 grossInterest: deltaInterest,
@@ -277,6 +282,7 @@ const calculateLoanFinancials = (loan, transactions) => {
             // Update tracking
             p.accruedSoFar += deltaInterest;
             accruedInterestSnapshot += deltaInterest;
+            p.lastAccruedDate = evtDate; // <--- UPDATE CHECKPOINT to Current Date
         }
     });
 
@@ -291,7 +297,7 @@ const calculateLoanFinancials = (loan, transactions) => {
                      paidRemaining -= deduction;
                  }
                  const netMonths = row.grossInterest / (row.amount * row.rate);
-                 row.months = netMonths;
+                 row.months = isFinite(netMonths) ? netMonths : 0; 
                  row.interest = Math.round(row.grossInterest); 
                  row.amount = Math.round(row.amount);
                  if (row.grossInterest > 0) breakdown.push(row);
@@ -300,7 +306,7 @@ const calculateLoanFinancials = (loan, transactions) => {
         } else {
              currentRows.forEach(row => {
                  const netMonths = row.grossInterest / (row.amount * row.rate);
-                 row.months = netMonths;
+                 row.months = isFinite(netMonths) ? netMonths : 0;
                  row.interest = Math.round(row.grossInterest);
                  row.amount = Math.round(row.amount);
                  breakdown.push(row);
@@ -316,10 +322,6 @@ const calculateLoanFinancials = (loan, transactions) => {
         
         if (discountCoveringInterest > 0) {
             accruedInterestSnapshot -= discountCoveringInterest;
-            // Distribute discount reduction across active principals 'accruedSoFar' 
-            // so we don't re-accrue it. 
-            // (Simplification: We reduce the snapshot, but keep p.accruedSoFar high. 
-            // This means Future Delta = NewTotal - OldHigh. It works.)
         }
 
         const remainingDiscount = event.discount - discountCoveringInterest;
@@ -331,17 +333,14 @@ const calculateLoanFinancials = (loan, transactions) => {
                 activePrincipals = [];
                 accruedInterestSnapshot = 0;
             } else {
-                // Reset to single chunk for simplicity after principal change
                 activePrincipals = [{ 
                     amount: newBal, 
                     startDate: evtDate, 
-                    accruedSoFar: 0, // Reset accrual tracking for new balance
-                    label: "Balance c/f" 
+                    accruedSoFar: 0, 
+                    label: "Balance c/f",
+                    isCarryOver: true,
+                    lastAccruedDate: evtDate // <--- RESET TRACKER
                 }];
-                // Immediate accrual on new balance? 
-                // calculateGoldLoanMonths(evtDate, evtDate) = 1.0.
-                // So next loop will charge 1 month immediately on this new balance.
-                // This aligns with "New loan/balance = New interest" logic.
             }
         }
         breakdown.push({
@@ -370,12 +369,13 @@ const calculateLoanFinancials = (loan, transactions) => {
            activePrincipals = [];
            accruedInterestSnapshot = 0;
         } else {
-           // Consolidate remaining principal
            activePrincipals = [{
              amount: newPrincipalBalance,
              startDate: evtDate, 
-             accruedSoFar: 0, // Reset accrual for new principal base
-             label: "Balance c/f"
+             accruedSoFar: 0,
+             label: "Balance c/f",
+             isCarryOver: true,
+             lastAccruedDate: evtDate // <--- RESET TRACKER
            }];
         }
       }
@@ -389,8 +389,14 @@ const calculateLoanFinancials = (loan, transactions) => {
     }
   }
 
-  const currentPrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
-  const finalOutstandingInterest = accruedInterestSnapshot;
+  let currentPrincipal = activePrincipals.reduce((sum, p) => sum + p.amount, 0);
+  let finalOutstandingInterest = accruedInterestSnapshot;
+  
+  if (loan.status === 'paid' || loan.status === 'forfeited') {
+      if (currentPrincipal < 1.0) currentPrincipal = 0;
+      if (finalOutstandingInterest < 1.0) finalOutstandingInterest = 0;
+  }
+
   const amountDue = currentPrincipal + finalOutstandingInterest;
 
   return {
@@ -684,7 +690,6 @@ app.post('/api/loans/:id/renew', authenticateToken, async (req, res) => {
     
     const intPaid = parseFloat(interestPaid) || 0;
     const prinPaid = parseFloat(principalPaid) || 0;
-    const prinAdded = parseFloat(principalAdded) || 0;
     const finalNewPrincipal = parseFloat(newPrincipal);
     const newRate = parseFloat(newInterestRate);
 
@@ -706,23 +711,20 @@ app.post('/api/loans/:id/renew', authenticateToken, async (req, res) => {
         await client.query('ROLLBACK'); return res.status(400).json({ error: "Loan must be active/overdue to renew." });
     }
 
-    // 2. Log Payments/Disbursements on Old Loan
+    // 2. Log Payments (Money In) on Old Loan
     if (intPaid > 0) {
         await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'interest', NOW(), $3)", [oldLoanId, intPaid, username]);
     }
     if (prinPaid > 0) {
         await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'principal', NOW(), $3)", [oldLoanId, prinPaid, username]);
+        // Also reduce old loan principal if paid down
+        const reducedPrincipal = parseFloat(oldLoan.principal_amount) - prinPaid;
+        await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2", [reducedPrincipal, oldLoanId]);
     }
     
-    // --- FIX: Handle Top-up Logic Correctly ---
-    if (prinAdded > 0) {
-        // A. Log transaction
-        await client.query("INSERT INTO Transactions (loan_id, amount_paid, payment_type, payment_date, changed_by_username) VALUES ($1, $2, 'disbursement', NOW(), $3)", [oldLoanId, prinAdded, username]);
-        
-        // B. UPDATE OLD LOAN PRINCIPAL (Critical for historical accuracy)
-        const updatedOldPrincipal = parseFloat(oldLoan.principal_amount) + prinAdded;
-        await client.query("UPDATE Loans SET principal_amount = $1 WHERE id = $2", [updatedOldPrincipal, oldLoanId]);
-    }
+    // --- FIX: REMOVED TOP-UP LOGIC FROM OLD LOAN ---
+    // The top-up (money out) is reflected in the New Loan's principal. 
+    // We do NOT touch the old loan for top-ups to avoid disbursement/interest bugs on the closed loan.
 
     // 3. Close Old Loan
     await client.query("UPDATE Loans SET status = 'paid', closed_date = NOW() WHERE id = $1", [oldLoanId]);
